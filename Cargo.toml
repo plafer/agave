@@ -344,6 +344,7 @@ protosol = "=17.0.0"
 qualifier_attr = { version = "0.2.2", default-features = false }
 quinn = { package = "anza-quinn", version = "=0.11.12-issue2860" }
 quinn-proto = { package = "anza-quinn-proto", version = "=0.11.18-issue2860" }
+quint-connect = "0.1.2"
 rand = "0.9.4"
 rand_chacha = "0.9.0"
 rayon = "1.12.0"

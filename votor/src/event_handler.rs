@@ -52,7 +52,11 @@ use {
     thiserror::Error,
 };
 
+#[cfg(test)]
+mod mbt;
 mod stats;
+#[cfg(test)]
+mod test_context;
 
 /// Banks that have completed replay, but are yet to be voted on
 /// in the form of (block, parent block)
@@ -1046,267 +1050,24 @@ fn request_switch(latest: &LatestSwitchRequest, my_pubkey: Pubkey, block: Block)
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
+        super::{
+            test_context::{EventHandlerTestContext, setup},
+            *,
+        },
         crate::{
-            commitment::CommitmentAggregationData,
-            event::{LeaderWindowInfo, RepairEventReceiver},
-            slot_clock::SharedAlpenglowSlotClock,
+            event::LeaderWindowInfo,
             vote_history_storage::{
-                FileVoteHistoryStorage, SavedVoteHistory, SavedVoteHistoryVersions,
-                VoteHistoryStorage,
+                SavedVoteHistory, SavedVoteHistoryVersions, VoteHistoryStorage,
             },
             voting_service::BLSOp,
         },
-        agave_bls_sigverify::rewards::RewardInput,
-        agave_votor_messages::{
-            consensus_message::{BLS_KEYPAIR_DERIVE_SEED, VoteMessage},
-            metric_types::ConsensusMetricsEventReceiver,
-            wire::get_vote_payload_to_sign,
-        },
-        crossbeam_channel::{Receiver, Sender, TryRecvError, bounded},
-        parking_lot::RwLock as PlRwLock,
-        solana_bls_signatures::{keypair::Keypair as BLSKeypair, signature::SignatureAffine},
-        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
+        agave_votor_messages::{consensus_message::VoteMessage, wire::get_vote_payload_to_sign},
+        crossbeam_channel::TryRecvError,
+        solana_bls_signatures::signature::SignatureAffine,
         solana_keypair::Keypair,
-        solana_ledger::{
-            blockstore::Blockstore, blockstore_options::BlockstoreOptions, get_tmp_ledger_path,
-            leader_schedule_cache::LeaderScheduleCache,
-        },
-        solana_net_utils::SocketAddrSpace,
-        solana_runtime::{
-            bank::{Bank, BankTestConfig, SlotLeader},
-            bank_forks::BankForks,
-            bank_forks_controller::{BankForksController, BankForksControllerError},
-            genesis_utils::{
-                ValidatorVoteKeypairs, create_genesis_config_with_alpenglow_vote_accounts,
-            },
-            installed_scheduler_pool::BankWithScheduler,
-        },
-        solana_streamer::evicting_sender::EvictingSender,
-        std::{
-            collections::HashMap,
-            fs::remove_file,
-            path::PathBuf,
-            sync::{Arc, RwLock},
-            time::Instant,
-        },
-        tempfile::TempDir,
+        solana_runtime::bank::{Bank, SlotLeader},
+        std::{fs::remove_file, path::PathBuf, sync::Arc, time::Instant},
     };
-
-    struct EventHandlerTestContext {
-        bls_receiver: Receiver<BLSOp>,
-        commitment_receiver: Receiver<CommitmentAggregationData>,
-        own_vote_receiver: Receiver<VoteMessage>,
-        #[allow(dead_code)] // Keep receiver alive to prevent SenderDisconnected errors
-        own_reward_aggregates_receiver: Receiver<RewardInput>,
-        bank_forks: Arc<RwLock<BankForks>>,
-        my_bls_keypair: BLSKeypair,
-        timer_manager: Arc<PlRwLock<TimerManager>>,
-        leader_window_info_receiver: Receiver<LeaderWindowInfo>,
-        highest_parent_ready: Arc<RwLock<(Slot, Block)>>,
-        drop_bank_receiver: Receiver<Vec<BankWithScheduler>>,
-        cluster_info: Arc<ClusterInfo>,
-        consensus_metrics_receiver: ConsensusMetricsEventReceiver,
-        #[allow(dead_code)] // Keep receiver alive to prevent SenderDisconnected errors
-        repair_event_receiver: RepairEventReceiver,
-        shared_context: SharedContext,
-        voting_context: VotingContext,
-        root_context: RootContext,
-        local_context: LocalContext,
-        bls_ops: Vec<BLSOp>,
-        vote_history_storage: Arc<FileVoteHistoryStorage>,
-        // Keep the temp directory alive for vote history and bank hash details.
-        _test_dir: TempDir,
-    }
-
-    struct DirectBankForksController {
-        my_pubkey: Pubkey,
-        bank_forks: Arc<RwLock<BankForks>>,
-        blockstore: Arc<Blockstore>,
-        leader_schedule_cache: Arc<LeaderScheduleCache>,
-        drop_bank_sender: Sender<Vec<BankWithScheduler>>,
-    }
-
-    impl BankForksController for DirectBankForksController {
-        fn insert_bank(&self, bank: Bank) -> Result<BankWithScheduler, BankForksControllerError> {
-            Ok(self.bank_forks.write().unwrap().insert(bank))
-        }
-
-        fn enqueue_set_root(&self, new_root: Block) {
-            let new_root = new_root.slot;
-            root_utils::check_and_handle_new_root(
-                new_root,
-                new_root,
-                None,
-                Some(new_root),
-                &None,
-                &self.drop_bank_sender,
-                &self.blockstore,
-                &self.leader_schedule_cache,
-                &self.bank_forks,
-                None,
-                &self.my_pubkey,
-                |_| {},
-            );
-        }
-
-        fn clear_bank(&self, slot: Slot) -> Result<(), BankForksControllerError> {
-            let bank_to_clear = self.bank_forks.read().unwrap().get_with_scheduler(slot);
-            if let Some(bank) = bank_to_clear {
-                let _ = bank.wait_for_completed_scheduler();
-            }
-
-            self.bank_forks.write().unwrap().clear_bank(slot, false);
-            Ok(())
-        }
-    }
-
-    fn setup() -> EventHandlerTestContext {
-        let (bls_sender, bls_receiver) = bounded(1024);
-        let (commitment_sender, commitment_receiver) = bounded(1024);
-        let (own_vote_sender, own_vote_receiver) = EvictingSender::new_bounded(1024);
-        let (reward_aggregates_sender, reward_aggregates_receiver) = bounded(1024);
-        let (drop_bank_sender, drop_bank_receiver) = bounded(1024);
-        let exit = Arc::new(AtomicBool::new(false));
-        let (event_sender, _event_receiver) = bounded(1024);
-        let (consensus_metrics_sender, consensus_metrics_receiver) = bounded(1024);
-        let (leader_window_info_sender, leader_window_info_receiver) = bounded(1024);
-        let (repair_event_sender, repair_event_receiver) = bounded(1024);
-        let latest_switch_request = LatestSwitchRequest::default();
-
-        // Create 10 node validatorvotekeypairs vec
-        let validator_keypairs = (0..10)
-            .map(|_| ValidatorVoteKeypairs::new(Keypair::new(), Keypair::new(), Keypair::new()))
-            .collect::<Vec<_>>();
-        let stakes = (0..validator_keypairs.len())
-            .rev()
-            .map(|i| 100_u64.saturating_add(i as u64))
-            .collect::<Vec<_>>();
-        let genesis = create_genesis_config_with_alpenglow_vote_accounts(
-            1_000_000_000,
-            &validator_keypairs,
-            stakes,
-        );
-        let my_index = 0;
-        let my_node_keypair = validator_keypairs[my_index].node_keypair.insecure_clone();
-        let my_vote_keypair = validator_keypairs[my_index].vote_keypair.insecure_clone();
-        let my_bls_keypair =
-            BLSKeypair::derive_from_signer(&my_vote_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
-        let test_dir = TempDir::new().unwrap();
-        let mut bank_test_config = BankTestConfig::default();
-        bank_test_config.accounts_db_config.bank_hash_details_dir = test_dir.path().to_path_buf();
-        let bank0 = Bank::new_with_paths_for_tests(
-            &genesis.genesis_config,
-            Some(bank_test_config),
-            vec![],
-            None,
-        );
-        let bank_forks = BankForks::new_rw_arc(bank0);
-        let contact_info = ContactInfo::new_localhost(&my_node_keypair.pubkey(), 0);
-        let cluster_info = Arc::new(ClusterInfo::new(
-            contact_info,
-            Arc::new(my_node_keypair.insecure_clone()),
-            SocketAddrSpace::Unspecified,
-        ));
-        let timer_manager = Arc::new(PlRwLock::new(TimerManager::new(
-            cluster_info.clone(),
-            event_sender,
-            exit,
-            Arc::default(),
-            Arc::new(MigrationStatus::default()),
-        )));
-        let blockstore = Arc::new(
-            Blockstore::open_with_options(
-                &get_tmp_ledger_path!(),
-                BlockstoreOptions::default_for_tests(),
-            )
-            .unwrap(),
-        );
-        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
-            &bank_forks.read().unwrap().root_bank(),
-        ));
-        let bank_forks_controller = Arc::new(DirectBankForksController {
-            my_pubkey: my_node_keypair.pubkey(),
-            bank_forks: bank_forks.clone(),
-            blockstore: blockstore.clone(),
-            leader_schedule_cache: leader_schedule_cache.clone(),
-            drop_bank_sender: drop_bank_sender.clone(),
-        });
-        let highest_parent_ready = Arc::new(RwLock::default());
-        let alpenglow_slot_clock = SharedAlpenglowSlotClock::default();
-
-        let vote_history_storage =
-            Arc::new(FileVoteHistoryStorage::new(test_dir.path().to_path_buf()));
-        let shared_context = SharedContext {
-            cluster_info: cluster_info.clone(),
-            alpenglow_slot_clock,
-            bank_forks: bank_forks.clone(),
-            vote_history_storage: vote_history_storage.clone(),
-            leader_window_info_sender,
-            blockstore: blockstore.clone(),
-            highest_parent_ready: highest_parent_ready.clone(),
-            repair_event_sender,
-            latest_switch_request,
-        };
-
-        let mut vote_history = VoteHistory::new(my_node_keypair.pubkey(), 0);
-        vote_history.initialize_genesis(Block::default());
-        let voting_context = VotingContext {
-            cluster_info: cluster_info.clone(),
-            identity_keypair: Arc::new(my_node_keypair.insecure_clone()),
-            sharable_banks: bank_forks.read().unwrap().sharable_banks(),
-            vote_history,
-            bls_sender,
-            commitment_sender,
-            vote_account_pubkey: my_vote_keypair.pubkey(),
-            wait_to_vote_slot: None,
-            authorized_voter_keypairs: Arc::new(RwLock::new(vec![Arc::new(my_vote_keypair)])),
-            vote_history_storage: vote_history_storage.clone(),
-            derived_bls_keypairs: HashMap::new(),
-            own_vote_sender,
-            own_reward_sender: reward_aggregates_sender,
-            consensus_metrics_sender,
-            leader_schedule: leader_schedule_cache,
-        };
-
-        let root_context = RootContext {
-            bank_notification_sender: None,
-            bank_forks_controller,
-        };
-
-        let local_context = LocalContext {
-            my_pubkey: my_node_keypair.pubkey(),
-            genesis_block: Block::default(),
-            pending_blocks: BTreeMap::new(),
-            finalized_blocks: BTreeSet::new(),
-            received_shred: BTreeSet::new(),
-            stats: EventHandlerStats::default(),
-            standstill_slot: None,
-        };
-
-        EventHandlerTestContext {
-            bls_receiver,
-            commitment_receiver,
-            own_vote_receiver,
-            own_reward_aggregates_receiver: reward_aggregates_receiver,
-            bank_forks,
-            my_bls_keypair,
-            timer_manager,
-            leader_window_info_receiver,
-            drop_bank_receiver,
-            cluster_info,
-            consensus_metrics_receiver,
-            repair_event_receiver,
-            highest_parent_ready,
-            shared_context,
-            voting_context,
-            root_context,
-            local_context,
-            bls_ops: vec![],
-            vote_history_storage,
-            _test_dir: test_dir,
-        }
-    }
 
     impl EventHandlerTestContext {
         fn send_parent_ready_event(&mut self, slot: Slot, parent_block: Block) {

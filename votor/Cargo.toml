@@ -76,7 +76,10 @@ wincode = { workspace = true, features = ["alloc"] }
 [dev-dependencies]
 agave-votor = { path = ".", features = ["dev-context-only-utils"] }
 agave-votor-transport = { workspace = true, features = ["dev-context-only-utils"] }
+anyhow = { workspace = true }
+quint-connect = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
 solana-net-utils = { path = "../net-utils", features = ["agave-unstable-api"] }
 solana-perf = { workspace = true }
 solana-runtime = { path = "../runtime", features = ["agave-unstable-api", "dev-context-only-utils"] }
