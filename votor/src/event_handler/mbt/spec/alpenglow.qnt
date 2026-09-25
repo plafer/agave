@@ -26,7 +26,9 @@ module alpenglow {
 
   /// Fields are lists indexed by slot
   type LocalState = {
-    pendingBlocks: List[Option[Block]],
+    // agave patch 1: every block received for a slot that could not be voted on yet, in
+    // arrival order (upstream: `List[Option[Block]]`, keeping only the latest block).
+    pendingBlocks: List[List[Block]],
     state: List[Set[SlotObject]],
   }
 
@@ -169,8 +171,13 @@ module alpenglow {
   pure def addObjects(ls: LocalState, slot: Slot, obj: Set[SlotObject]): LocalState =
     { ...ls, state: ls.state.replaceAt(slot, ls.state[slot].union(obj)) }
 
-  pure def setPendingBlock(ls: LocalState, slot: Slot, b: Option[Block]): LocalState =
-    { ...ls, pendingBlocks: ls.pendingBlocks.replaceAt(slot, b) }
+  // agave patch 1: replaces upstream's `setPendingBlock`.
+  pure def appendPendingBlock(ls: LocalState, slot: Slot, b: Block): LocalState =
+    { ...ls, pendingBlocks: ls.pendingBlocks.replaceAt(slot, ls.pendingBlocks[slot].append(b)) }
+
+  // agave patch 1: replaces upstream's `setPendingBlock(slot, None)`.
+  pure def clearPendingBlocks(ls: LocalState, slot: Slot): LocalState =
+    { ...ls, pendingBlocks: ls.pendingBlocks.replaceAt(slot, []) }
 
   /// line 10 of TryNotar. TODO: Is there more to it?
   pure def firstSlotInLeaderWindow(slot: Slot): bool =
@@ -307,7 +314,7 @@ module alpenglow {
         val s2 = ls
           .addObjects(b.slot, Set(Voted, VotedNotar(b.hash)))
           // Won't vote notar a second time
-          .setPendingBlock(b.slot, None)
+          .clearPendingBlocks(b.slot)
 
         // Maybe vote finalize as well
         val tf = tryFinal(s2, b.slot, b.hash)
@@ -333,7 +340,7 @@ module alpenglow {
         val s2 = s.post
           .addObjects(k, Set(Voted, BadWindow))
           // Won't vote notar after skip
-          .setPendingBlock(k, None)
+          .clearPendingBlocks(k)
 
         { output: s.output.union(update), post: s2 }
       else
@@ -343,14 +350,12 @@ module alpenglow {
   pure def checkPendingBlocks(ls: LocalState): Result =
     // Iterate with increasing slot
     // (left to right)
-    ls.pendingBlocks.foldl({ output: Set(), post: ls }, (res, pendingBlock) =>
-      match pendingBlock {
-        | Some(b) =>
-          val tn = tryNotar(res.post, b)
-          { output: res.output.union(tn.result.output), post: tn.result.post } // TODO implement
-        | None =>
-          res
-      }
+    // agave patch 1: within a slot, try the pending blocks in arrival order.
+    ls.pendingBlocks.foldl({ output: Set(), post: ls }, (res, pendingBlocks) =>
+      pendingBlocks.foldl(res, (res2, b) =>
+        val tn = tryNotar(res2.post, b)
+        { output: res2.output.union(tn.result.output), post: tn.result.post }
+      )
     )
 
 
@@ -365,7 +370,7 @@ module alpenglow {
           { post: cpb.post, output: cpb.output.union(tn.result.output) }
           // both, tryNotar and checkPendingBlocks have side effects of sending messages. Thus we build the union here.
         else if (not(Voted.in(tn.result.post.state[b.slot])))
-          { output: tn.result.output, post: tn.result.post.setPendingBlock(b.slot, Some(b)) }
+          { output: tn.result.output, post: tn.result.post.appendPendingBlock(b.slot, b) }
         else
           // Even if all if conditions evaluate to false, tryNotar may have side effects and may change the local state
           { output: tn.result.output, post: tn.result.post } // The state might have changed although all if conditions evaluate to false

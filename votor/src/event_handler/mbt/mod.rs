@@ -25,16 +25,25 @@
 //! `TimeoutCrashedLeader`, `BlockNotarFallback`, `ProduceWindow`, `Finalized`, `Standstill`,
 //! `SetIdentity`) are never sent.
 //!
-//! Replaying a trace currently checks that `handle_event` neither fails nor panics (for example
-//! on a `VoteHistory` equivocation assert), that it only emits `BLSOp::PushVote`, and that a
-//! timer is set after every `ParentReady`. The node state is not yet compared with the spec's.
+//! Replaying a trace checks that `handle_event` neither fails nor panics (for example on a
+//! `VoteHistory` equivocation assert), that it only emits `BLSOp::PushVote`, and that a timer is
+//! set after every `ParentReady`. After every step, the votes pushed by all nodes since `init`
+//! must equal the spec's `msgBuffer`. The nodes' per-slot state is not yet compared with the
+//! spec's `system`.
+//!
+//! The vendored spec is patched where agave's behavior is the intended one, and extended with the
+//! agave-specific `agave_window` instance. `spec/README.md` lists every patch.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
 mod mapping;
+mod spec_types;
 
 use {
-    self::mapping::{Banks, OFFSET, SpecBlock, agave_slot, block_ref},
+    self::{
+        mapping::{Banks, OFFSET, SpecBlock, agave_slot, block_ref, to_spec_message},
+        spec_types::{NetworkMsg, SpecState},
+    },
     super::{
         EventHandler,
         test_context::{EventHandlerTestContext, SharedFixtures, setup_node},
@@ -46,10 +55,10 @@ use {
     },
     agave_votor_messages::consensus_message::Block,
     anyhow::{anyhow, bail, ensure},
-    quint_connect::{Config, Driver, Path, Result, Step, quint_run, switch},
+    quint_connect::{Config, Driver, Path, Result, State, Step, quint_run, switch},
     std::{
         any::Any,
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         marker::PhantomData,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::Arc,
@@ -58,14 +67,29 @@ use {
 
 type Node = EventHandlerTestContext<NullVoteHistoryStorage>;
 
-/// A spec instance module: which ITF variable holds the environment, and the spec's processes.
+/// A spec instance module: which ITF variable holds the environment, and the instance's
+/// constants that the driver needs, copied from `spec/statemachine.qnt`.
 trait Instance {
     /// Path to the environment variable `s` in each ITF state.
     const STATE_PATH: Path;
     /// `(process id, stake, is benevolent)` for every spec process, with stakes copied from the
     /// instance's `power` table. Byzantine processes get a stake but no node.
     const PROCESSES: &'static [(&'static str, u64, bool)];
+    /// The instance's `correctBlocks` and `byzantineBlocks`. Every block picked by a trace must
+    /// be listed, and a block's parent is built from this list when it is one of its blocks.
+    const BLOCKS: &'static [SpecBlock];
 }
+
+/// Blocks of the `some_byz` and `some_byz_vp` instances.
+const UPSTREAM_BLOCKS: &[SpecBlock] = &[
+    SpecBlock::new(0, 42, -1),
+    SpecBlock::new(1, 43, 42),
+    SpecBlock::new(2, 44, 43),
+    SpecBlock::new(1, 46, 42),
+    SpecBlock::new(1, 47, 45),
+    SpecBlock::new(2, 48, 43),
+    SpecBlock::new(2, 49, 45),
+];
 
 /// The `some_byz` instance: five equal-stake correct processes and one Byzantine process.
 struct SomeByz;
@@ -80,6 +104,36 @@ impl Instance for SomeByz {
         ("v5", 1, true),
         ("b1", 1, false),
     ];
+    const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
+}
+
+/// The `some_byz_vp` instance: two correct processes and one Byzantine process, with different
+/// stakes.
+struct SomeByzVp;
+
+impl Instance for SomeByzVp {
+    const STATE_PATH: Path = &["some_byz_vp::consensus::s"];
+    const PROCESSES: &'static [(&'static str, u64, bool)] =
+        &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
+    const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
+}
+
+/// The agave-specific `agave_window` instance, whose slot 4 starts a second leader window, so
+/// that traces can replay `parentReadyAction`.
+struct AgaveWindow;
+
+impl Instance for AgaveWindow {
+    const STATE_PATH: Path = &["agave_window::consensus::s"];
+    const PROCESSES: &'static [(&'static str, u64, bool)] =
+        &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
+    const BLOCKS: &'static [SpecBlock] = &[
+        SpecBlock::new(0, 42, -1),
+        SpecBlock::new(1, 43, 42),
+        SpecBlock::new(4, 50, 42),
+        SpecBlock::new(4, 51, 43),
+        SpecBlock::new(1, 46, 42),
+        SpecBlock::new(4, 52, 45),
+    ];
 }
 
 /// Replays spec traces against one event handler per benevolent spec process.
@@ -89,6 +143,8 @@ struct VotorMbtDriver<I: Instance> {
     banks: Banks,
     /// Benevolent processes only, keyed by spec process id.
     nodes: BTreeMap<String, Node>,
+    /// Every vote pushed by a node since `init`: agave's counterpart of the spec's `msgBuffer`.
+    msg_buffer: BTreeSet<NetworkMsg>,
     stats: ReplayStats,
     _instance: PhantomData<I>,
 }
@@ -116,8 +172,9 @@ impl<I: Instance> VotorMbtDriver<I> {
         let genesis = fixtures.bank_forks.read().unwrap().root_bank();
         Self {
             _fixtures: fixtures,
-            banks: Banks::new(genesis),
+            banks: Banks::new(genesis, I::BLOCKS),
             nodes,
+            msg_buffer: BTreeSet::new(),
             stats: ReplayStats::default(),
             _instance: PhantomData,
         }
@@ -125,6 +182,7 @@ impl<I: Instance> VotorMbtDriver<I> {
 
     /// Spec `init`: every benevolent process starts with `ParentReady(-1)` at slot 0.
     fn init(&mut self) -> Result {
+        self.msg_buffer.clear();
         let ids: Vec<String> = self.nodes.keys().cloned().collect();
         for id in ids {
             self.node(&id)?.reset();
@@ -134,7 +192,7 @@ impl<I: Instance> VotorMbtDriver<I> {
     }
 
     fn receive_block(&mut self, v: &str, block: SpecBlock) -> Result {
-        let bank = self.banks.bank_for(&block);
+        let bank = self.banks.bank_for(&block)?;
         let slot = agave_slot(block.slot);
         self.handle(v, VotorEvent::Block(CompletedBlock { slot, bank }))
     }
@@ -170,8 +228,9 @@ impl<I: Instance> VotorMbtDriver<I> {
         Ok(())
     }
 
-    /// Passes `event` to the event handler of process `v`. Errors and panics are both turned
-    /// into errors so that quint-connect reports the seed that reproduces them.
+    /// Passes `event` to the event handler of process `v` and records the votes it pushes in
+    /// `msg_buffer`. Errors and panics are both turned into errors so that quint-connect reports
+    /// the seed that reproduces them.
     fn handle(&mut self, v: &str, event: VotorEvent) -> Result {
         let description = format!("{v}: {event:?}");
         let node = self.node(v)?;
@@ -195,8 +254,12 @@ impl<I: Instance> VotorMbtDriver<I> {
         };
         for op in ops {
             match op {
-                BLSOp::PushVote { .. } => {
+                BLSOp::PushVote { vote } => {
                     self.stats.votes = self.stats.votes.saturating_add(1);
+                    self.msg_buffer.insert(NetworkMsg {
+                        sender: v.to_string(),
+                        msg: to_spec_message(&vote.vote)?,
+                    });
                 }
                 BLSOp::PushCertificates { .. }
                 | BLSOp::RefreshVotes { .. }
@@ -215,9 +278,16 @@ impl<I: Instance> VotorMbtDriver<I> {
     }
 }
 
+impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
+    fn from_driver(driver: &VotorMbtDriver<I>) -> Result<Self> {
+        Ok(SpecState {
+            msg_buffer: driver.msg_buffer.clone(),
+        })
+    }
+}
+
 impl<I: Instance> Driver for VotorMbtDriver<I> {
-    // No state is compared yet.
-    type State = ();
+    type State = SpecState;
 
     fn config() -> Config {
         Config {
@@ -262,7 +332,10 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
 impl<I: Instance> Drop for VotorMbtDriver<I> {
     fn drop(&mut self) {
         let ReplayStats { actions, votes } = &self.stats;
-        eprintln!("votor MBT replay: actions {actions:?}, votes pushed {votes}");
+        eprintln!(
+            "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}",
+            I::STATE_PATH.join(".")
+        );
     }
 }
 
@@ -276,7 +349,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 
 /// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
 ///
-/// Run with: `cargo nextest run -p agave-votor --run-ignored ignored-only mbt`
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
 #[ignore]
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
@@ -285,4 +358,32 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 )]
 fn mbt_votor_some_byz() -> impl Driver {
     VotorMbtDriver::<SomeByz>::new()
+}
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+#[ignore]
+#[quint_run(
+    spec = "src/event_handler/mbt/spec/statemachine.qnt",
+    main = "some_byz_vp",
+    max_samples = 30
+)]
+fn mbt_votor_some_byz_vp() -> impl Driver {
+    VotorMbtDriver::<SomeByzVp>::new()
+}
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+///
+/// Only about one trace in 13 reaches `parentReadyAction`, hence the larger sample.
+#[ignore]
+#[quint_run(
+    spec = "src/event_handler/mbt/spec/statemachine.qnt",
+    main = "agave_window",
+    max_samples = 200
+)]
+fn mbt_votor_agave_window() -> impl Driver {
+    VotorMbtDriver::<AgaveWindow>::new()
 }

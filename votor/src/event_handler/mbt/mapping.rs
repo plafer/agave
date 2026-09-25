@@ -7,9 +7,12 @@
 //!   agave reports for children of the genesis bank. Every other spec hash `h` maps to a fixed,
 //!   distinct `Hash`.
 //! - Spec blocks are turned into frozen banks that are never inserted into `BankForks`.
+//! - Votes map back onto spec messages through the inverses of the slot and hash mappings.
 
 use {
-    agave_votor_messages::consensus_message::Block,
+    super::spec_types::{BlockRef, Message},
+    agave_votor_messages::{consensus_message::Block, vote::Vote},
+    anyhow::{Context, Result, anyhow, bail, ensure},
     serde::Deserialize,
     solana_clock::Slot,
     solana_hash::Hash,
@@ -29,6 +32,18 @@ pub(super) fn agave_slot(s: i64) -> Slot {
     s.checked_add(OFFSET).expect("spec slot overflow")
 }
 
+/// Inverse of [`agave_slot`].
+pub(super) fn spec_slot(slot: Slot) -> Result<i64> {
+    let s = slot
+        .checked_sub(OFFSET)
+        .ok_or_else(|| anyhow!("agave slot {slot} is below spec slot 0"))?;
+    i64::try_from(s).context("agave slot out of range")
+}
+
+/// Last byte of every block id that [`hash_of`] mints. Keeps every mapped hash distinct from
+/// `Hash::default()`, including for `h == 0`.
+const HASH_MARKER: u8 = 0xa1;
+
 /// Maps a spec hash onto an agave block id.
 pub(super) fn hash_of(h: i64) -> Hash {
     if h == GENESIS_HASH {
@@ -36,9 +51,42 @@ pub(super) fn hash_of(h: i64) -> Hash {
     }
     let mut bytes = [0_u8; 32];
     bytes[..8].copy_from_slice(&h.to_le_bytes());
-    // Keeps every mapped hash distinct from `Hash::default()`, including for `h == 0`.
-    bytes[31] = 0xa1;
+    bytes[31] = HASH_MARKER;
     Hash::new_from_array(bytes)
+}
+
+/// Inverse of [`hash_of`].
+pub(super) fn spec_hash(hash: &Hash) -> Result<i64> {
+    if *hash == Hash::default() {
+        return Ok(GENESIS_HASH);
+    }
+    let bytes = hash.as_bytes();
+    let (h, rest) = bytes.split_at(8);
+    ensure!(
+        rest.iter().rev().skip(1).all(|&b| b == 0) && rest.last() == Some(&HASH_MARKER),
+        "block id {hash} was not minted by `hash_of`"
+    );
+    Ok(i64::from_le_bytes(h.try_into().expect("8 bytes")))
+}
+
+/// Maps an agave block back onto a spec block reference.
+fn spec_block_ref(block: &Block) -> Result<BlockRef> {
+    Ok(BlockRef {
+        slot: spec_slot(block.slot)?,
+        hash: spec_hash(&block.block_id)?,
+    })
+}
+
+/// Maps a vote cast by agave onto the spec message it broadcasts.
+pub(super) fn to_spec_message(vote: &Vote) -> Result<Message> {
+    Ok(match vote {
+        Vote::Notarize(vote) => Message::NotarVoteMsg(spec_block_ref(&vote.block)?),
+        Vote::NotarizeFallback(vote) => Message::NotarFallBackVoteMsg(spec_block_ref(&vote.block)?),
+        Vote::Skip(vote) => Message::SkipVoteMsg(spec_slot(vote.slot)?),
+        Vote::SkipFallback(vote) => Message::SkipFallbackVoteMsg(spec_slot(vote.slot)?),
+        Vote::Finalize(vote) => Message::FinalVoteMsg(spec_slot(vote.slot)?),
+        Vote::Genesis(_) => bail!("genesis votes have no spec counterpart: {vote:?}"),
+    })
 }
 
 /// Maps a spec block reference onto an agave block. The genesis hash maps to the genesis block
@@ -61,16 +109,25 @@ pub(super) struct SpecBlock {
     pub(super) parent: i64,
 }
 
+impl SpecBlock {
+    pub(super) const fn new(slot: i64, hash: i64, parent: i64) -> Self {
+        Self { slot, hash, parent }
+    }
+}
+
 /// Frozen banks for spec blocks, built lazily and cached across traces.
 pub(super) struct Banks {
     genesis: Arc<Bank>,
+    /// Every block of the spec instance (`allBlocks`).
+    blocks: &'static [SpecBlock],
     by_hash: HashMap<i64, Arc<Bank>>,
 }
 
 impl Banks {
-    pub(super) fn new(genesis: Arc<Bank>) -> Self {
+    pub(super) fn new(genesis: Arc<Bank>, blocks: &'static [SpecBlock]) -> Self {
         Self {
             genesis,
+            blocks,
             by_hash: HashMap::new(),
         }
     }
@@ -80,26 +137,35 @@ impl Banks {
     ///
     /// Its parent is, in order of preference:
     /// - the genesis bank, if `block.parent` is the genesis hash;
-    /// - the bank already built for `block.parent`;
+    /// - the bank for `block.parent`, if that is a block of the instance (built first if needed);
     /// - a phantom frozen bank at the slot just before `block` with `block_id =
     ///   hash_of(block.parent)`. Placing it at `slot - 1` makes agave's "consecutive parent" check
     ///   pass, so the decision falls through to whether the node voted to notarize the parent,
-    ///   mirroring the spec's `VotedNotar(b.parent) ∈ state[b.slot - 1]`.
-    pub(super) fn bank_for(&mut self, block: &SpecBlock) -> Arc<Bank> {
+    ///   mirroring the spec's `VotedNotar(b.parent) ∈ state[b.slot - 1]`. The spec never
+    ///   notarizes a hash that is not a block, so neither side ever votes for such a child.
+    pub(super) fn bank_for(&mut self, block: &SpecBlock) -> Result<Arc<Bank>> {
+        let blocks = self.blocks;
+        ensure!(
+            blocks.contains(block),
+            "{block:?} is not in the driver's copy of the instance's blocks"
+        );
         let slot = agave_slot(block.slot);
         if let Some(bank) = self.by_hash.get(&block.hash) {
-            assert_eq!(
-                (bank.slot(), bank.block_id()),
-                (slot, Some(hash_of(block.hash))),
+            ensure!(
+                (bank.slot(), bank.block_id()) == (slot, Some(hash_of(block.hash))),
                 "spec hash {} reused for a different block",
                 block.hash
             );
-            return bank.clone();
+            return Ok(bank.clone());
         }
         let parent = if block.parent == GENESIS_HASH {
             self.genesis.clone()
-        } else if let Some(parent) = self.by_hash.get(&block.parent) {
-            parent.clone()
+        } else if let Some(&parent) = blocks.iter().find(|b| b.hash == block.parent) {
+            ensure!(
+                parent.slot < block.slot,
+                "parent {parent:?} of {block:?} is not in an earlier slot"
+            );
+            self.bank_for(&parent)?
         } else {
             let phantom_slot = slot
                 .checked_sub(1)
@@ -108,7 +174,7 @@ impl Banks {
         };
         let bank = frozen_bank(parent, slot, hash_of(block.hash));
         self.by_hash.insert(block.hash, bank.clone());
-        bank
+        Ok(bank)
     }
 }
 

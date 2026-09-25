@@ -51,21 +51,22 @@ module consensus {
   /// msgBuffer with byzantine messages.
   val allMessages = s.msgBuffer.union(byzNetworkMsgs)
 
+  /// agave patch 3: number of slots each process keeps state for. Covers `windowSlots(slot)`
+  /// for every alive slot, since `trySkipWindow` touches the whole window (upstream: a fixed 5).
+  pure val numSlots = 4 * (aliveSlots.fold(0, (m, x) => max(m, x)) / 4 + 1)
+
   action init = all {
     s' = {
       system: benevolent.mapBy(_ => {
-        // preload state for 5 slots
-        state: [
-          Set(ParentReady(-1)),
-          Set(),
-          Set(),
-          Set(),
-          Set(),
-        ],
-        pendingBlocks: [None, None, None, None, None]
+        // preload state for `numSlots` slots (agave patch 3)
+        state: range(0, numSlots).listMap(i => if (i == 0) Set(ParentReady(-1)) else Set()),
+        // agave patch 1: one list of pending blocks per slot
+        pendingBlocks: range(0, numSlots).listMap(_ => []),
       }),
       msgBuffer: Set(),
-      activeTimeouts: benevolent.mapBy(v => Set(0)),
+      // agave patch 4: `ParentReady(-1)` at slot 0 starts the timeouts of its whole window,
+      // as `ParentReadyInput` does via `setTimeouts` (upstream: `Set(0)`).
+      activeTimeouts: benevolent.mapBy(v => windowSlots(0)),
     },
     ch' = aliveSlots.mapBy(s => Set()),
     counter' = 0,
@@ -133,7 +134,10 @@ module consensus {
           isCertified(NotarizationCertificate(b.reference()), msgs),
           isCertified(NotarFallbackCertificate(b.reference()), msgs)
         },
-        b.slot.to(slot).subseteq(slotsSkipCertified(msgs))
+        // agave patch 2: only the slots strictly between `b` and `slot`, as in the comment
+        // above (upstream: `b.slot.to(slot)`, which also requires skip certificates for
+        // `b.slot` and `slot`).
+        (b.slot + 1).to(slot - 1).subseteq(slotsSkipCertified(msgs))
       }
     )
   }
@@ -144,7 +148,9 @@ module consensus {
     all {
       bs.size() > 0,
       nondet b = bs.oneOf()
-      v.processInput(ParentReadyInput(b.reference())),
+      // agave patch 2: the input is `ParentReady(s, hash(b))` for the slot `s = now` that
+      // became ready (upstream: `b.reference()`, which records the parent at `b.slot` instead).
+      v.processInput(ParentReadyInput({ slot: now, hash: b.hash })),
     }
 
   /// Definition 16 (fallback events)
@@ -477,4 +483,31 @@ module too_many_byz {
       .subseteq(allMessages))
   
 
+}
+
+
+/// agave-specific instance (not upstream). The upstream instances only have slots 0..2, so
+/// slot 0 is their only first slot of a leader window, and `parentReadyAction` can never fire.
+/// Here slot 4 starts a second window, whose parent can be block 42 (after slots 1..3 are
+/// skipped) or block 43 or 46 (after slots 2..3 are skipped).
+module agave_window {
+  import consensus(
+    correct = Set("v1", "v2"),
+    good = Set(),
+    byzantine = Set("b1"),
+    // v1 and b1 together reach the 60% certificate threshold.
+    power = Map("v1" -> 3, "v2" -> 2, "b1" -> 1),
+    correctBlocks = Set(
+      { slot: 0, hash: 42, parent: -1 },
+      { slot: 1, hash: 43, parent: 42 },
+      { slot: 4, hash: 50, parent: 42 },
+      { slot: 4, hash: 51, parent: 43 },
+    ),
+    byzantineBlocks = Set(
+      { slot: 1, hash: 46, parent: 42 },
+      { slot: 4, hash: 52, parent: 45 },
+    ),
+    aliveSlots = 0.to(4),
+    aliveHashes = Set(42, 43, 46, 50, 51, 52),
+  ).*
 }
