@@ -216,13 +216,15 @@ module alpenglow {
   // block that can be reached from b by the parent links, i.e., b, b’s parent,
   // b’s parent’s parent, and so on. If b′ is an ancestor of b, b is a
   // descendant of b′ . Note that b is its own ancestor and descendant.
-  pure def isDescendant(a: Block, b: Block): bool = {
+  // agave patch 7: the parent links are those of `blocks`, the environment's block set
+  // (upstream: `allBlocks`).
+  pure def isDescendant(a: Block, b: Block, blocks: Set[Block]): bool = {
     // TODO: this can have better performance if we can make assumptions about slots
     // Filter by minimal slot
     // The slot of the parent will always be smaller then that of the child
     // but its not in increments of 1 like in mysticeti
     pure val bAncestors = (b.slot.to(a.slot)).fold(Set(b.hash), (path, s) =>
-      pure val potentialAncestors = allBlocks.filter(block => block.slot == s)
+      pure val potentialAncestors = blocks.filter(block => block.slot == s)
       pure val ancestors = potentialAncestors.filter(ancestor =>
         path.exists(h => ancestor.parent == h)
       )
@@ -270,8 +272,9 @@ module alpenglow {
 
   /// If a finalization certificate on slot s is in Pool, the unique notarized block
   /// in slot s is finalized (we call this slow-finalized).
-  pure def finalized(slot: Slot, msgs: Set[NetworkMsg]): Set[Blockhash] =
-    allBlocks.map(b => b.reference())
+  /// agave patch 7: over `blocks`, the environment's block set (upstream: `allBlocks`).
+  pure def finalized(slot: Slot, msgs: Set[NetworkMsg], blocks: Set[Block]): Set[Blockhash] =
+    blocks.map(b => b.reference())
       .filter(b => b.slot == slot)
       .filter(b => {
         isCertified(FinalizationCertificate(b.slot), msgs)
@@ -281,8 +284,9 @@ module alpenglow {
 
   /// If a fast-finalization certificate on block b is in Pool, the block b is
   /// finalized (fast-finalized).
-  pure def fastFinalized(slot: Slot, msgs: Set[NetworkMsg]): Set[Blockhash] =
-    allBlocks.map(b => b.reference())
+  /// agave patch 7: over `blocks`, the environment's block set (upstream: `allBlocks`).
+  pure def fastFinalized(slot: Slot, msgs: Set[NetworkMsg], blocks: Set[Block]): Set[Blockhash] =
+    blocks.map(b => b.reference())
       .filter(b => b.slot == slot)
       .filter(b => isCertified(FastFinalizationCertificate(b), msgs))
       .map(b => b.hash)

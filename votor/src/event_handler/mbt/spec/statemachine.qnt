@@ -5,6 +5,10 @@ module consensus {
 
   /// This is all the information of the global state
   type Environment = {
+    // agave patch 7: the blocks of this trace, fixed by `init` (upstream: the constant
+    // `allBlocks`). Every action and invariant reads the blocks from here.
+    blocks: Set[Block],
+
     // The local state of each process
     system: ProcessID -> LocalState,
 
@@ -38,7 +42,9 @@ module consensus {
 
   var s: Environment
 
-  val finalizedBlocks: Slot -> Set[Blockhash] = aliveSlots.mapBy(s => finalized(s, allMessages))
+  // agave patch 7: over `s.blocks` (upstream: `allBlocks`, via `finalized`).
+  val finalizedBlocks: Slot -> Set[Blockhash] =
+    aliveSlots.mapBy(slot => finalized(slot, allMessages, s.blocks))
 
   var ch: Slot -> Set[Blockhash] // blockchain as seen by message soup. Ancestors not seen as finalized here if they are not finalized themselves
 
@@ -55,8 +61,10 @@ module consensus {
   /// for every alive slot, since `trySkipWindow` touches the whole window (upstream: a fixed 5).
   pure val numSlots = 4 * (aliveSlots.fold(0, (m, x) => max(m, x)) / 4 + 1)
 
-  action init = all {
+  /// agave patch 7: initializes the environment with the trace's `blocks`.
+  action initWith(blocks: Set[Block]): bool = all {
     s' = {
+      blocks: blocks,
       system: benevolent.mapBy(_ => {
         // preload state for `numSlots` slots (agave patch 3)
         state: range(0, numSlots).listMap(i => if (i == 0) Set(ParentReady(-1)) else Set()),
@@ -72,13 +80,21 @@ module consensus {
     counter' = 0,
   }
 
+  /// agave patch 7: the trace's blocks are the instance's `allBlocks`. The singleton pick
+  /// records them in `mbt::nondetPicks`, which is how the model-based tests learn them.
+  action init = {
+    nondet blocks = Set(allBlocks).oneOf()
+    initWith(blocks)
+  }
+
+  // agave patch 7: this and the actions below read `s.blocks` (upstream: `allBlocks`).
   action receiveSpecificBlock(v: ProcessID, b: Block): bool = all {
-    allBlocks.contains(b),
+    s.blocks.contains(b),
     v.processInput(BlockInput(b)),
   }
 
   action receiveBlock(v: ProcessID, now: Slot): bool = all{
-    nondet block = allBlocks.filter(b => b.slot == now).oneOf()
+    nondet block = s.blocks.filter(b => b.slot == now).oneOf()
     receiveSpecificBlock(v, block)
   }
 
@@ -113,7 +129,7 @@ module consensus {
   /// build a set of data (blocks or slot numbers) for which a certain event is enabled,
   /// and then we pick one non-deterministically, process it, and updated the global state.
   action blockNotarizedAction(v: ProcessID, now: Slot): bool =
-    val bs = allBlocks.filter(b =>
+    val bs = s.blocks.filter(b =>
       notarizedBlocksCondition(v, { slot: now, hash: b.hash })
     )
     all {
@@ -125,9 +141,10 @@ module consensus {
   // • ParentReady(s, hash(b)): Slot s is the first of its leader window, and Pool
   // holds a notarization or notar-fallback certificate for a previous block b,
   // and skip certificates for every slot s′ since b, i.e., for slot(b) < s′ < s.
-  pure def parentReadyBlocks(slot: Slot, msgs: Set[NetworkMsg]): Set[Block] = {
+  // agave patch 7: takes the environment's `blocks` (upstream: `allBlocks`).
+  pure def parentReadyBlocks(slot: Slot, msgs: Set[NetworkMsg], blocks: Set[Block]): Set[Block] = {
     if (not(firstSlotInLeaderWindow(slot))) Set() else
-    allBlocks.filter(b =>
+    blocks.filter(b =>
       and {
         b.slot < slot,
         or {
@@ -144,7 +161,7 @@ module consensus {
 
   /// Emit ParentReady and process it
   action parentReadyAction(v: ProcessID, now: Slot): bool =
-    val bs = parentReadyBlocks(now, allMessages)
+    val bs = parentReadyBlocks(now, allMessages, s.blocks)
     all {
       bs.size() > 0,
       nondet b = bs.oneOf()
@@ -197,7 +214,7 @@ module consensus {
 
   // Emit SafeToNotar and process it
   action safeToNotarAction(v: ProcessID, now: Slot): bool =
-    val bs = allBlocks.filter(b => safeToNotarCondition(v, now, b))
+    val bs = s.blocks.filter(b => safeToNotarCondition(v, now, b))
     all {
       bs.size() > 0,
       nondet b = bs.oneOf()
@@ -294,11 +311,15 @@ module consensus {
   //
   //
 
+  // agave patch 7: the invariants and witnesses read `s.blocks` (upstream: `allBlocks`).
   val agreement =
-    aliveSlots.forall(slot => finalized(slot, allMessages).size() <= 1)
+    aliveSlots.forall(slot => finalized(slot, allMessages, s.blocks).size() <= 1)
 
   val fastAgreement =
-    aliveSlots.forall(slot => fastFinalized(slot, allMessages).union(finalized(slot, allMessages)).size() <= 1)
+    aliveSlots.forall(slot =>
+      fastFinalized(slot, allMessages, s.blocks)
+        .union(finalized(slot, allMessages, s.blocks))
+        .size() <= 1)
 
   // Witness was used to find bug in safeToNotar encoding
   val noBad =
@@ -306,7 +327,7 @@ module consensus {
 
   /// Witness to find a run where a block is fast finalized
   val fastFinalizedWitness =
-    allBlocks.forall(b => not(isCertified(FastFinalizationCertificate(b.reference()), allMessages)))
+    s.blocks.forall(b => not(isCertified(FastFinalizationCertificate(b.reference()), allMessages)))
 
   /// Witness to find a run where a timeout is started
   val timeoutWitness = 
@@ -314,11 +335,11 @@ module consensus {
 
   /// Theorem 1 (safety). If any correct node finalizes a block b in slot s and any
   /// correct node finalizes any block b′ in any slot s′ ≥ s, b′ is a descendant of b.
-  val safety = tuples(aliveSlots, allBlocks).forall(((slot, block)) => {
-    val finalizedAtSlot = finalized(slot, allMessages)
+  val safety = tuples(aliveSlots, s.blocks).forall(((slot, block)) => {
+    val finalizedAtSlot = finalized(slot, allMessages, s.blocks)
     block.hash.in(finalizedAtSlot) implies tuples(
-      aliveSlots.filter(s2 => s2 >= slot), allBlocks).forall(((slot2, block2)) => {
-      block2.hash.in(finalized(slot2, allMessages)) implies block2.isDescendant(block)
+      aliveSlots.filter(s2 => s2 >= slot), s.blocks).forall(((slot2, block2)) => {
+      block2.hash.in(finalized(slot2, allMessages, s.blocks)) implies block2.isDescendant(block, s.blocks)
     })
   })
 
@@ -370,7 +391,7 @@ module some_byz {
     .then(receiveSpecificBlock("v2", { hash: 42, parent: -1, slot: 0 }))
     .then(receiveSpecificBlock("v3", { hash: 42, parent: -1, slot: 0 }))
     .then(receiveSpecificBlock("v4", { hash: 42, parent: -1, slot: 0 }))
-    .expect(fastFinalized(0, allMessages) == Set(42))
+    .expect(fastFinalized(0, allMessages, s.blocks) == Set(42))
 
 }
 
@@ -404,7 +425,7 @@ module some_byz_vp {
   //   init
   //   .then(receiveSpecificBlock("v1", { hash: 42, parent: -1, slot: 0 }))
   //   .then(receiveSpecificBlock("v2", { hash: 42, parent: -1, slot: 0 }))
-  //   .expect(fastFinalized(0, allMessages) == Set(42))
+  //   .expect(fastFinalized(0, allMessages, s.blocks) == Set(42))
 
 }
 

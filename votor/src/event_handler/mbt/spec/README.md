@@ -108,6 +108,30 @@ Neither patch changes the set of broadcast messages, since `msgBuffer` is a
 set. With both, a correct process never broadcasts the same message twice,
 which the model-based tests check on the agave side.
 
+### Patch 7: the block set is part of the environment
+
+`alpenglow.qnt` (`isDescendant`, `finalized`, `fastFinalized`),
+`statemachine.qnt` (`Environment`, `init`, the actions, the invariants and
+witnesses).
+
+Not a fix, and not to be reported upstream. Upstream reads the constant
+`allBlocks` wherever it needs the blocks. The patch adds a `blocks` field to
+`Environment`, set once by the new `initWith(blocks)` action, and has
+`receiveSpecificBlock`, `receiveBlock`, `blockNotarizedAction`,
+`parentReadyBlocks`, `safeToNotarAction`, `finalizedBlocks`, and the
+invariants and witnesses read `s.blocks`. The three pure helpers in
+`alpenglow.qnt` that fold over blocks take the block set as an extra
+parameter. `consensus` is untouched, and `applyEffect` spreads the rest of
+the environment, so no action's assignments change.
+
+`init` is now `nondet blocks = Set(allBlocks).oneOf()` followed by
+`initWith(blocks)`, so every instance keeps its fixed blocks and its traces.
+The singleton pick records the block set in the `init` state's
+`mbt::nondetPicks`. The model-based tests cannot read the ITF state itself,
+so this pick is how the driver learns each trace's blocks, and it no longer
+keeps its own copy of them. This prepares for instances that generate a
+different block set per trace.
+
 ### Addition: the `agave_window` instance
 
 `statemachine.qnt`.

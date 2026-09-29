@@ -3,8 +3,10 @@
 //! [quint-connect] runs `quint run --mbt` on the vendored spec in `spec/` and replays every
 //! generated trace step against agave. Each benevolent spec process gets its own
 //! [`EventHandlerTestContext`], and each spec action becomes exactly one [`VotorEvent`] passed to
-//! [`EventHandler::handle_event`] for the process that took the step. See `mapping.rs` for how
-//! spec slots, hashes, and blocks map onto agave values.
+//! [`EventHandler::handle_event`] for the process that took the step. The driver has no copy of
+//! the instance's blocks: each trace's `init` step picks the trace's block set, and the driver
+//! builds a bank for each block from that pick. See `mapping.rs` for how spec slots, hashes, and
+//! blocks map onto agave values.
 //!
 //! # Running
 //!
@@ -73,6 +75,7 @@
 //! 5. `VotedNotarFallback(hash)` and `VotedSkipFallback` record fallback votes, which are cast at
 //!    most once per block or slot, as in agave.
 //! 6. `tryFinal` requires `not(ItsOver)`, as agave's `try_final` does.
+//! 7. The block set is part of the environment, and `init` exposes it as a nondet pick.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
@@ -118,24 +121,10 @@ trait Instance {
     /// `(process id, stake, is benevolent)` for every spec process, with stakes copied from the
     /// instance's `power` table. Byzantine processes get a stake but no node.
     const PROCESSES: &'static [(&'static str, u64, bool)];
-    /// The instance's `correctBlocks` and `byzantineBlocks`. Every block picked by a trace must
-    /// be listed, and a block's parent is built from this list when it is one of its blocks.
-    const BLOCKS: &'static [SpecBlock];
     /// The instance's `numSlots` (agave patch 3): the length of every per-slot list in a
     /// process's `LocalState`.
     const NUM_SLOTS: usize;
 }
-
-/// Blocks of the `some_byz` and `some_byz_vp` instances.
-const UPSTREAM_BLOCKS: &[SpecBlock] = &[
-    SpecBlock::new(0, 42, -1),
-    SpecBlock::new(1, 43, 42),
-    SpecBlock::new(2, 44, 43),
-    SpecBlock::new(1, 46, 42),
-    SpecBlock::new(1, 47, 45),
-    SpecBlock::new(2, 48, 43),
-    SpecBlock::new(2, 49, 45),
-];
 
 /// The `some_byz` instance: five equal-stake correct processes and one Byzantine process.
 struct SomeByz;
@@ -150,7 +139,6 @@ impl Instance for SomeByz {
         ("v5", 1, true),
         ("b1", 1, false),
     ];
-    const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
     const NUM_SLOTS: usize = 4;
 }
 
@@ -162,7 +150,6 @@ impl Instance for SomeByzVp {
     const STATE_PATH: Path = &["some_byz_vp::consensus::s"];
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
-    const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
     const NUM_SLOTS: usize = 4;
 }
 
@@ -174,14 +161,6 @@ impl Instance for AgaveWindow {
     const STATE_PATH: Path = &["agave_window::consensus::s"];
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
-    const BLOCKS: &'static [SpecBlock] = &[
-        SpecBlock::new(0, 42, -1),
-        SpecBlock::new(1, 43, 42),
-        SpecBlock::new(4, 50, 42),
-        SpecBlock::new(4, 51, 43),
-        SpecBlock::new(1, 46, 42),
-        SpecBlock::new(4, 52, 45),
-    ];
     const NUM_SLOTS: usize = 8;
 }
 
@@ -221,7 +200,7 @@ impl<I: Instance> VotorMbtDriver<I> {
         let genesis = fixtures.bank_forks.read().unwrap().root_bank();
         Self {
             _fixtures: fixtures,
-            banks: Banks::new(genesis, I::BLOCKS),
+            banks: Banks::new(genesis),
             nodes,
             msg_buffer: BTreeSet::new(),
             stats: ReplayStats::default(),
@@ -229,8 +208,10 @@ impl<I: Instance> VotorMbtDriver<I> {
         }
     }
 
-    /// Spec `init`: every benevolent process starts with `ParentReady(-1)` at slot 0.
-    fn init(&mut self) -> Result {
+    /// Spec `init`: the trace's blocks are `blocks`, and every benevolent process starts with
+    /// `ParentReady(-1)` at slot 0.
+    fn init(&mut self, blocks: BTreeSet<SpecBlock>) -> Result {
+        self.banks.reset(blocks)?;
         self.msg_buffer.clear();
         let ids: Vec<String> = self.nodes.keys().cloned().collect();
         for id in ids {
@@ -340,7 +321,10 @@ impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
         let system = driver
             .nodes
             .iter()
-            .map(|(v, node)| Ok((v.clone(), project_local_state::<I>(v, node)?)))
+            .map(|(v, node)| {
+                let local_state = project_local_state::<I>(v, node, driver.banks.blocks())?;
+                Ok((v.clone(), local_state))
+            })
             .collect::<Result<_>>()?;
         Ok(SpecState {
             system,
@@ -353,23 +337,26 @@ impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
 /// slots `0..I::NUM_SLOTS`.
 ///
 /// `VoteHistory` is queried through its accessors, so the flags that carry a hash are probed with
-/// every hash of the instance (its blocks and their parents, plus the genesis hash). Every hash
-/// agave sees comes from one of these, since the driver builds every event from the instance's
-/// blocks.
-fn project_local_state<I: Instance>(v: &str, node: &Node) -> Result<LocalState> {
+/// every hash of the trace's `blocks` and their parents, plus the genesis hash. Every hash agave
+/// sees comes from one of these, since the driver builds every event from the trace's blocks.
+fn project_local_state<I: Instance>(
+    v: &str,
+    node: &Node,
+    blocks: &BTreeSet<SpecBlock>,
+) -> Result<LocalState> {
     let vote_history = &node.voting_context.vote_history;
-    let hashes: BTreeSet<i64> = I::BLOCKS
+    let hashes: BTreeSet<i64> = blocks
         .iter()
         .flat_map(|b| [b.hash, b.parent])
         .chain([GENESIS_HASH])
         .collect();
-    // The agave block a spec `ParentReady(h)` refers to. Only blocks of the instance (and the
-    // genesis block) can become parent-ready in the spec.
+    // The agave block a spec `ParentReady(h)` refers to. Only the trace's blocks (and the genesis
+    // block) can become parent-ready in the spec.
     let parent_ref = |h: i64| {
         if h == GENESIS_HASH {
             Some(Block::default())
         } else {
-            I::BLOCKS
+            blocks
                 .iter()
                 .find(|b| b.hash == h)
                 .map(|b| block_ref(b.slot, h))
@@ -452,19 +439,7 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
             .or_default();
         *count = count.saturating_add(1);
         switch!(step {
-            init => self.init()?,
-            // TODO(plafer): Remove since we upgraded to 0.33.0
-            // Quint 0.32.0 sometimes labels the initial state of a trace with the step action's
-            // name instead of `init`. `step` is never the innermost action of a later state,
-            // since every branch of its `any` is a named action, so only the initial state can
-            // carry it, and then without any nondet picks.
-            step => {
-                ensure!(
-                    step.nondet_picks.get("v").is_none(),
-                    "`step` reported as the action of a non-initial state"
-                );
-                self.init()?
-            },
+            init(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
             receiveBlock(v: String, block: SpecBlock) => self.receive_block(&v, block)?,
             fireTimeoutEvent(v: String, slot: i64) => self.fire_timeout(&v, slot)?,
             blockNotarizedAction(v: String, b: SpecBlock) => self.block_notarized(&v, b)?,

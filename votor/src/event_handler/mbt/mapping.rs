@@ -18,7 +18,10 @@ use {
     solana_clock::Slot,
     solana_hash::Hash,
     solana_runtime::bank::{Bank, SlotLeader},
-    std::{collections::HashMap, sync::Arc},
+    std::{
+        collections::{BTreeSet, HashMap},
+        sync::Arc,
+    },
 };
 
 /// Agave slot of spec slot 0.
@@ -120,72 +123,105 @@ pub(super) struct SpecBlock {
     pub(super) parent: i64,
 }
 
-impl SpecBlock {
-    pub(super) const fn new(slot: i64, hash: i64, parent: i64) -> Self {
-        Self { slot, hash, parent }
-    }
-}
-
-/// Frozen banks for spec blocks, built lazily and cached across traces.
+/// Frozen banks for the blocks of the current trace, built at `init` from the trace's block set.
 pub(super) struct Banks {
     genesis: Arc<Bank>,
-    /// Every block of the spec instance (`allBlocks`).
-    blocks: &'static [SpecBlock],
+    /// The trace's blocks (the spec environment's `blocks`).
+    blocks: BTreeSet<SpecBlock>,
+    /// The bank of every block in `blocks`, keyed by its spec hash.
     by_hash: HashMap<i64, Arc<Bank>>,
 }
 
 impl Banks {
-    pub(super) fn new(genesis: Arc<Bank>, blocks: &'static [SpecBlock]) -> Self {
+    /// Creates an empty set of banks. [`Banks::reset`] must be called before any lookup.
+    pub(super) fn new(genesis: Arc<Bank>) -> Self {
         Self {
             genesis,
-            blocks,
+            blocks: BTreeSet::new(),
             by_hash: HashMap::new(),
         }
     }
 
-    /// Returns the frozen bank for `block`, with `slot = agave_slot(block.slot)` and
-    /// `block_id = hash_of(block.hash)`.
+    /// Makes `blocks` the trace's block set, and builds a frozen bank for each of them, with
+    /// `slot = agave_slot(block.slot)` and `block_id = hash_of(block.hash)`. Keeps the existing
+    /// banks if `blocks` equals the previous trace's set.
     ///
-    /// Its parent is, in order of preference:
+    /// Blocks are built in slot order. A block's parent bank is:
     /// - the genesis bank, if `block.parent` is the genesis hash;
-    /// - the bank for `block.parent`, if that is a block of the instance (built first if needed);
-    /// - a phantom frozen bank at the slot just before `block` with `block_id =
+    /// - the bank for `block.parent`, if that is one of `blocks`;
+    /// - otherwise a phantom frozen bank at the slot just before `block` with `block_id =
     ///   hash_of(block.parent)`. Placing it at `slot - 1` makes agave's "consecutive parent" check
     ///   pass, so the decision falls through to whether the node voted to notarize the parent,
     ///   mirroring the spec's `VotedNotar(b.parent) ∈ state[b.slot - 1]`. The spec never
     ///   notarizes a hash that is not a block, so neither side ever votes for such a child.
-    pub(super) fn bank_for(&mut self, block: &SpecBlock) -> Result<Arc<Bank>> {
-        let blocks = self.blocks;
-        ensure!(
-            blocks.contains(block),
-            "{block:?} is not in the driver's copy of the instance's blocks"
-        );
-        let slot = agave_slot(block.slot);
-        if let Some(bank) = self.by_hash.get(&block.hash) {
-            ensure!(
-                (bank.slot(), bank.block_id()) == (slot, Some(hash_of(block.hash))),
-                "spec hash {} reused for a different block",
-                block.hash
-            );
-            return Ok(bank.clone());
+    ///
+    /// Fails if two blocks share a hash, or if a block's parent is one of `blocks` but not in an
+    /// earlier slot.
+    pub(super) fn reset(&mut self, blocks: BTreeSet<SpecBlock>) -> Result<()> {
+        if blocks == self.blocks {
+            return Ok(());
         }
-        let parent = if block.parent == GENESIS_HASH {
-            self.genesis.clone()
-        } else if let Some(&parent) = blocks.iter().find(|b| b.hash == block.parent) {
+        self.blocks.clear();
+        self.by_hash.clear();
+
+        let mut by_hash: HashMap<i64, SpecBlock> = HashMap::with_capacity(blocks.len());
+        for &block in &blocks {
             ensure!(
-                parent.slot < block.slot,
-                "parent {parent:?} of {block:?} is not in an earlier slot"
+                block.hash != GENESIS_HASH,
+                "{block:?} uses the genesis hash {GENESIS_HASH}"
             );
-            self.bank_for(&parent)?
-        } else {
-            let phantom_slot = slot
-                .checked_sub(1)
-                .expect("agave slots of spec blocks are positive");
-            frozen_bank(self.genesis.clone(), phantom_slot, hash_of(block.parent))
-        };
-        let bank = frozen_bank(parent, slot, hash_of(block.hash));
-        self.by_hash.insert(block.hash, bank.clone());
-        Ok(bank)
+            if let Some(other) = by_hash.insert(block.hash, block) {
+                bail!("{other:?} and {block:?} share a hash");
+            }
+        }
+
+        // `SpecBlock` orders by slot first, so every parent in `blocks` is built before its
+        // children.
+        let mut banks: HashMap<i64, Arc<Bank>> = HashMap::with_capacity(blocks.len());
+        for block in &blocks {
+            let slot = agave_slot(block.slot);
+            let parent = if block.parent == GENESIS_HASH {
+                self.genesis.clone()
+            } else if let Some(parent) = by_hash.get(&block.parent) {
+                ensure!(
+                    parent.slot < block.slot,
+                    "parent {parent:?} of {block:?} is not in an earlier slot"
+                );
+                banks
+                    .get(&parent.hash)
+                    .expect("blocks of earlier slots are built first")
+                    .clone()
+            } else {
+                let phantom_slot = slot
+                    .checked_sub(1)
+                    .expect("agave slots of spec blocks are positive");
+                frozen_bank(self.genesis.clone(), phantom_slot, hash_of(block.parent))
+            };
+            banks.insert(block.hash, frozen_bank(parent, slot, hash_of(block.hash)));
+        }
+
+        self.blocks = blocks;
+        self.by_hash = banks;
+        Ok(())
+    }
+
+    /// Returns the frozen bank built for `block` by [`Banks::reset`]. Fails if `block` is not one
+    /// of the trace's blocks.
+    pub(super) fn bank_for(&self, block: &SpecBlock) -> Result<Arc<Bank>> {
+        ensure!(
+            self.blocks.contains(block),
+            "{block:?} is not one of the trace's blocks"
+        );
+        Ok(self
+            .by_hash
+            .get(&block.hash)
+            .expect("every block of the trace has a bank")
+            .clone())
+    }
+
+    /// The trace's blocks.
+    pub(super) fn blocks(&self) -> &BTreeSet<SpecBlock> {
+        &self.blocks
     }
 }
 
