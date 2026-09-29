@@ -50,7 +50,7 @@
 //!   while agave arms one two-phase timer per window that fires in slot order by wall-clock
 //!   time. `activeTimeouts` is not compared. Instead `fireTimeoutEvent` injects `Timeout`
 //!   directly, and each `ParentReady` must leave a timer set for its slot.
-//! - The spec's `ch` (finalized chain) and `counter` (trace bound), which are environment
+//! - The spec's `ch` (finalized chain) and `counter` (step count), which are environment
 //!   bookkeeping.
 //! - Agave-only events, which are never sent: `FirstShred`, `TimeoutCrashedLeader`,
 //!   `BlockNotarFallback`, `ProduceWindow`, `Finalized`, `Standstill`, and `SetIdentity`. With no
@@ -79,6 +79,12 @@
 //! 6. `tryFinal` requires `not(ItsOver)`, as agave's `try_final` does.
 //! 7. The block set is part of the environment, and `init` exposes it as a nondet pick.
 //! 8. `initGenerated` draws a block tree per trace, for the `agave_gen` instance.
+//! 9. `step` favors steps that make progress: each process's lowest unvoted slot, and fewer
+//!    timeouts and repeated block deliveries. Traces are as long as each test's `max_steps`.
+//! 10. The Byzantine soup leaves out votes for generated hashes of other slots, which no
+//!     generated block has, to make `agave_gen` steps faster.
+//! 11. `isDescendant` walks slots in ascending order, which `quint run`'s Rust backend does not
+//!     guarantee for a fold over a set. Only the `safety` invariant reads it.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
@@ -91,7 +97,7 @@ use {
             Banks, GENESIS_HASH, OFFSET, SpecBlock, agave_slot, block_ref, hash_of, spec_hash,
             spec_slot, to_spec_block, to_spec_message,
         },
-        spec_types::{LocalState, NetworkMsg, SlotObject, SpecState},
+        spec_types::{LocalState, Message, NetworkMsg, SlotObject, SpecState},
     },
     super::{
         EventHandler,
@@ -203,16 +209,46 @@ struct ReplayStats {
     traces: usize,
     /// Number of traces whose block tree has each shape.
     tree_shapes: BTreeMap<TreeShape, usize>,
+    /// Number of traces that take each action, or push each kind of vote, at least once.
+    traces_with: BTreeMap<String, usize>,
+    /// The actions taken and the kinds of vote pushed so far in the current trace.
+    current_trace: BTreeSet<String>,
 }
 
 impl ReplayStats {
-    fn record_tree(&mut self, blocks: &BTreeSet<SpecBlock>, num_slots: usize) {
+    /// Starts a new trace whose block tree is `blocks`.
+    fn start_trace(&mut self, blocks: &BTreeSet<SpecBlock>, num_slots: usize) {
+        self.finish_trace();
         self.traces = self.traces.saturating_add(1);
         for shape in TreeShape::of(blocks, num_slots) {
             let count = self.tree_shapes.entry(shape).or_default();
             *count = count.saturating_add(1);
         }
     }
+
+    /// Adds the current trace's actions and vote kinds to `traces_with`.
+    fn finish_trace(&mut self) {
+        for name in std::mem::take(&mut self.current_trace) {
+            let count = self.traces_with.entry(name).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn record_action(&mut self, action: &str) {
+        let count = self.actions.entry(action.to_string()).or_default();
+        *count = count.saturating_add(1);
+        self.current_trace.insert(action.to_string());
+    }
+
+    fn record_vote(&mut self, msg: &Message) {
+        self.votes = self.votes.saturating_add(1);
+        self.current_trace.insert(msg.kind().to_string());
+    }
+}
+
+/// `count` of `total` as a whole percentage.
+fn percent(count: usize, total: usize) -> usize {
+    count.saturating_mul(100).checked_div(total).unwrap_or(0)
 }
 
 /// Shapes of a trace's block tree that [`ReplayStats`] counts. They are computed from the
@@ -302,7 +338,7 @@ impl<I: Instance> VotorMbtDriver<I> {
     /// Spec `init`: the trace's blocks are `blocks`, and every benevolent process starts with
     /// `ParentReady(-1)` at slot 0.
     fn init(&mut self, blocks: BTreeSet<SpecBlock>) -> Result {
-        self.stats.record_tree(&blocks, I::NUM_SLOTS);
+        self.stats.start_trace(&blocks, I::NUM_SLOTS);
         self.banks.reset(blocks)?;
         self.msg_buffer.clear();
         let ids: Vec<String> = self.nodes.keys().cloned().collect();
@@ -377,11 +413,11 @@ impl<I: Instance> VotorMbtDriver<I> {
         for op in ops {
             match op {
                 BLSOp::PushVote { vote } => {
-                    self.stats.votes = self.stats.votes.saturating_add(1);
                     let msg = NetworkMsg {
                         sender: v.to_string(),
                         msg: to_spec_message(&vote.vote)?,
                     };
+                    self.stats.record_vote(&msg.msg);
                     // `msgBuffer` is a set, so a repeated vote is invisible to the state
                     // comparison. With agave patches 5 and 6 a correct spec process never
                     // broadcasts the same message twice, and neither should agave.
@@ -524,12 +560,16 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
     }
 
     fn step(&mut self, step: &Step) -> Result {
-        let count = self
-            .stats
-            .actions
-            .entry(step.action_taken.clone())
-            .or_default();
-        *count = count.saturating_add(1);
+        self.replay(step)?;
+        // After the step, so that an `init` step counts towards the trace it starts.
+        self.stats.record_action(&step.action_taken);
+        Ok(())
+    }
+}
+
+impl<I: Instance> VotorMbtDriver<I> {
+    /// Replays one trace step: the spec action becomes one event for the process that took it.
+    fn replay(&mut self, step: &Step) -> Result {
         switch!(step {
             init(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
             initGenerated(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
@@ -547,25 +587,32 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
 
 impl<I: Instance> Drop for VotorMbtDriver<I> {
     fn drop(&mut self) {
+        self.stats.finish_trace();
         let ReplayStats {
             actions,
             votes,
             traces,
             tree_shapes,
+            traces_with,
+            current_trace: _,
         } = &self.stats;
         let tree_shapes: Vec<String> = TreeShape::ALL
             .iter()
             .map(|shape| {
                 let count = tree_shapes.get(shape).copied().unwrap_or_default();
-                let percent = count.saturating_mul(100).checked_div(*traces).unwrap_or(0);
-                format!("{shape:?} {count} ({percent}%)")
+                format!("{shape:?} {count} ({}%)", percent(count, *traces))
             })
+            .collect();
+        let traces_with: Vec<String> = traces_with
+            .iter()
+            .map(|(name, &count)| format!("{name} {count} ({}%)", percent(count, *traces)))
             .collect();
         eprintln!(
             "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}, traces {traces}, \
-             traces whose block tree has: {}",
+             traces whose block tree has: {}, traces with each action or vote: {}",
             I::STATE_PATH.join("."),
             tree_shapes.join(", "),
+            traces_with.join(", "),
         );
     }
 }
@@ -585,7 +632,8 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "some_byz",
-    max_samples = 100
+    max_samples = 100,
+    max_steps = 20
 )]
 fn mbt_votor_some_byz() -> impl Driver {
     VotorMbtDriver::<SomeByz>::new()
@@ -598,7 +646,8 @@ fn mbt_votor_some_byz() -> impl Driver {
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "some_byz_vp",
-    max_samples = 100
+    max_samples = 100,
+    max_steps = 20
 )]
 fn mbt_votor_some_byz_vp() -> impl Driver {
     VotorMbtDriver::<SomeByzVp>::new()
@@ -607,13 +656,12 @@ fn mbt_votor_some_byz_vp() -> impl Driver {
 /// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
 ///
 /// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
-///
-/// Only about one trace in 13 reaches `parentReadyAction`, hence the larger sample.
 #[ignore]
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "agave_window",
-    max_samples = 200
+    max_samples = 100,
+    max_steps = 20
 )]
 fn mbt_votor_agave_window() -> impl Driver {
     VotorMbtDriver::<AgaveWindow>::new()
@@ -623,13 +671,15 @@ fn mbt_votor_agave_window() -> impl Driver {
 ///
 /// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
 ///
-/// Every trace starts from its own generated block tree (spec patch 8).
+/// Every trace starts from its own generated block tree (spec patch 8). Its traces are longer
+/// than the other instances', so that they get past the first leader window.
 #[ignore]
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "agave_gen",
     init = "initGenerated",
-    max_samples = 200
+    max_samples = 180,
+    max_steps = 60
 )]
 fn mbt_votor_agave_gen() -> impl Driver {
     VotorMbtDriver::<AgaveGen>::new()

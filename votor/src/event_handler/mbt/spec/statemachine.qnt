@@ -55,7 +55,24 @@ module consensus {
   /// and the ones that byzantine processes may send. We use this in the actions to allow
   /// processes to respond to byzantine behavior. At the same time, we don't clutter
   /// msgBuffer with byzantine messages.
-  val allMessages = s.msgBuffer.union(byzNetworkMsgs)
+  /// agave patch 10: over `byzSoup` (upstream: `byzNetworkMsgs`).
+  val allMessages = s.msgBuffer.union(byzSoup)
+
+  /// agave patch 10: whether `hash` is a `genHash` (agave patch 8) of a slot other than `slot`.
+  /// The fixed instances' hashes are below 100, so this never holds for them.
+  pure def isGenHashOfOtherSlot(slot: Slot, hash: Blockhash): bool =
+    hash >= 100 and (hash - 100) / 10 != slot
+
+  /// agave patch 10: the Byzantine messages, without the votes for a block reference whose hash
+  /// is a `genHash` of another slot. No generated block has such a reference, and every slot
+  /// keeps the votes for its own `genHash`es, so no certificate or condition on the trace's
+  /// blocks changes. In `agave_gen` this leaves 24 of the 192 block references and makes
+  /// `quint run` about three times faster. For the fixed instances it is `byzNetworkMsgs`.
+  pure val byzSoup = byzNetworkMsgs.filter(m => match m.msg {
+    | NotarVoteMsg(r) => not(isGenHashOfOtherSlot(r.slot, r.hash))
+    | NotarFallBackVoteMsg(r) => not(isGenHashOfOtherSlot(r.slot, r.hash))
+    | _ => true
+  })
 
   /// agave patch 3: number of slots each process keeps state for. Covers `windowSlots(slot)`
   /// for every alive slot, since `trySkipWindow` touches the whole window (upstream: a fixed 5).
@@ -106,7 +123,11 @@ module consensus {
     )
 
   /// agave patch 8: the parent of the primary block of `slot`, by `kind.get(slot)`:
-  /// - 0..5, honest: the primary block of the latest earlier slot that has one (or genesis);
+  /// - 0..5, honest: the primary block of the latest earlier slot that has one (or genesis).
+  ///   At the first slot of a later window, the leader builds on its `ParentReady`, which is
+  ///   often a block early in the previous window whose later slots were skipped. So there the
+  ///   parent is the latest primary block up to the previous window's slot `k % 4`: its first
+  ///   slot for 0 and 4, its second for 1 and 5, its third for 2, and its last for 3;
   /// - 7, phantom: `genHash(slot - 1, 9)`, which is never a block (genesis at slot 0);
   /// - 8, far back: the primary block of the second-latest earlier slot that has one (or genesis);
   /// - 9, genesis.
@@ -114,7 +135,10 @@ module consensus {
   pure def primaryParent(kind: Slot -> int, slot: Slot): Blockhash =
     val k = kind.get(slot)
     val latest = latestPrimaries(kind, slot)
-    if (k <= 5) latest._1
+    if (k <= 5) {
+      if (slot > 0 and firstSlotInLeaderWindow(slot)) latestPrimaries(kind, slot - 3 + k % 4)._1
+      else latest._1
+    }
     else if (k == 7) (if (slot == 0) -1 else genHash(slot - 1, 9))
     else if (k == 8) latest._2
     else -1
@@ -345,14 +369,50 @@ module consensus {
     }
 
 
+  /// agave patch 9: the slot where a process makes progress next: its lowest alive slot without
+  /// a vote. All alive slots once the process voted in every one of them.
+  pure def frontierSlots(ls: LocalState): Set[Slot] =
+    val unvoted = aliveSlots.filter(slot => not(Voted.in(ls.state[slot])))
+    if (unvoted.size() == 0) aliveSlots else Set(unvoted.fold(numSlots, (m, x) => min(m, x)))
+
+  /// agave patch 9: whether delivering a block of `slot` to a process in local state `ls` can
+  /// only repeat an earlier delivery: the process voted in `slot`, so `consensus` ignores the
+  /// block, or every block of `slot` is already pending, so it would be appended again.
+  def redundantDelivery(ls: LocalState, slot: Slot): bool = or {
+    Voted.in(ls.state[slot]),
+    s.blocks.filter(b => b.slot == slot).forall(b =>
+      ls.pendingBlocks[slot].foldl(false, (found, p) => found or p == b)),
+  }
+
   /// Main step action. Includes all behavior
+  /// agave patch 9: biases the scheduler towards steps that make progress. Upstream bounds
+  /// traces with `counter < 10`, picks `slot` uniformly from `aliveSlots`, and responds to a
+  /// message (`messageResponse`) as often as it fires a timeout. Here:
+  /// - the trace length is left to `--max-steps`;
+  /// - `slot` is `v`'s frontier slot in half of the steps;
+  /// - a timeout may only fire in one step in four;
+  /// - a redundant block delivery may only happen in one step in four.
+  /// The branches of `messageResponse` are inlined to gate `receiveBlock`. `any` picks among the
+  /// enabled branches, so the gating makes these steps rarer without disabling the step, and
+  /// every interleaving stays possible.
   action step = all {
-    counter < 10,
     nondet v = oneOf(benevolent)
-    nondet slot = oneOf(aliveSlots)
+    nondet slotCoin = 0.to(1).oneOf()
+    nondet slot = oneOf(if (slotCoin == 0) aliveSlots else frontierSlots(s.system.get(v)))
+    nondet timeoutCoin = 0.to(3).oneOf()
+    nondet redeliveryCoin = 0.to(3).oneOf()
     any {
-      messageResponse(v, slot),
-      fireTimeoutEvent(v, slot),
+      any {
+        all {
+          redeliveryCoin == 0 or not(redundantDelivery(s.system.get(v), slot)),
+          receiveBlock(v, slot),
+        },
+        blockNotarizedAction(v, slot),
+        parentReadyAction(v, slot),
+        safeToNotarAction(v, slot),
+        safeToSkipAction(v, slot),
+      },
+      all { timeoutCoin == 0, fireTimeoutEvent(v, slot) },
     }
   }
 
@@ -416,6 +476,33 @@ module consensus {
   val noEmptySlotsWitness = 
     aliveSlots.exists(s1 => 
       ch.get(s1).size() == 0)
+
+  // agave patch 9: coverage witnesses for tuning the scheduler without the model-based tests,
+  // for example `quint run statemachine.qnt --main=agave_gen --init=initGenerated
+  // --witnesses notarizedInWindow1 parentReadySlot4 notarFallbackVoted skipFallbackVoted
+  // slotFinalized`. `--witnesses` counts the traces with a state where each one holds.
+
+  /// A benevolent process saw a block notarized in window 1 (slots 4..7).
+  val notarizedInWindow1 = benevolent.exists(v =>
+    aliveSlots.filter(slot => slot >= 4).exists(slot =>
+      s.system.get(v).state[slot].exists(o => match o { | BlockNotarized(_) => true | _ => false })))
+
+  /// A benevolent process has `ParentReady` for slot 4, the first slot of window 1.
+  val parentReadySlot4 = benevolent.exists(v =>
+    aliveSlots.filter(slot => slot == 4).exists(slot =>
+      s.system.get(v).state[slot].exists(o => match o { | ParentReady(_) => true | _ => false })))
+
+  /// A benevolent process cast a notar-fallback vote.
+  val notarFallbackVoted =
+    s.msgBuffer.exists(m => match m.msg { | NotarFallBackVoteMsg(_) => true | _ => false })
+
+  /// A benevolent process cast a skip-fallback vote.
+  val skipFallbackVoted =
+    s.msgBuffer.exists(m => match m.msg { | SkipFallbackVoteMsg(_) => true | _ => false })
+
+  /// A slot is finalized, slowly or fast.
+  val slotFinalized = aliveSlots.exists(slot =>
+    finalized(slot, allMessages, s.blocks).union(fastFinalized(slot, allMessages, s.blocks)).size() > 0)
 
   // TODO finalize ancestors locally
 }

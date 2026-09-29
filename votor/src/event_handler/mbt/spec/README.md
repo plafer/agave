@@ -16,7 +16,7 @@ does not typecheck at the upstream commit.
 
 Every change to the vendored files is listed here, with the reason for it.
 Each changed spot is marked with an `agave patch N` comment. Patches 1, 2,
-4, 5, and 6 are to be reported upstream.
+4, 5, 6, and 11 are to be reported upstream.
 
 ### Patch 1: pending blocks are a per-slot list, tried in arrival order
 
@@ -148,7 +148,15 @@ Per slot:
   primary block of the latest earlier slot that has one), 6 is a crashed
   leader (no block), 7 a phantom parent that is never a block, 8 a parent
   further back (the primary block of the second-latest earlier slot that has
-  one), and 9 the genesis parent.
+  one), and 9 the genesis parent. At the first slot of a window other than
+  window 0, the honest parent is instead the latest primary block up to slot
+  `k % 4` of the previous window (its first slot for 0 and 4, its second for
+  1 and 5, its third for 2, its last for 3). An honest leader builds on its
+  `ParentReady`, which is often a block early in the previous window whose
+  later slots were skipped. With "the latest earlier slot" only, the parent of
+  a window-1 block rarely matched a `ParentReady` of slot 4: with the patch 9
+  scheduler and 60 steps, 5 to 7% of 200 traces notarized a window-1 block
+  (the `notarizedInWindow1` witness), against 14 to 20% with this rule.
 - `equiv` in `0..7`: 0 adds an equivocating block with the same parent as the
   primary block, 1 one with a different parent, and 2 to 7 nothing.
 
@@ -166,6 +174,72 @@ Its `correctBlocks` and `byzantineBlocks` are empty, so it must be run with
 use, so the Byzantine message soup does not depend on the trace's tree. The
 `blocks` pick is still how the model-based tests learn the tree; they never
 read `kind` or `equiv`. `consensus` in `alpenglow.qnt` is untouched.
+
+### Patch 9: a scheduler biased towards progress, without a step bound
+
+`statemachine.qnt` (`frontierSlots`, `redundantDelivery`, `step`, and the
+witnesses `notarizedInWindow1`, `parentReadySlot4`, `notarFallbackVoted`,
+`skipFallbackVoted`, `slotFinalized`).
+
+Not a fix, and not to be reported upstream. Upstream's `step` requires
+`counter < 10`, picks `slot` uniformly from `aliveSlots`, and fires a timeout
+as often as it responds to a message. With generated trees over two windows,
+traces then rarely leave window 0: nodes skip it before two of them vote for
+the same block, and most steps deliver a block that the node already has or
+cannot use. The patch changes `step` only:
+
+- There is no bound on `counter`; each test's `max_steps` sets the trace
+  length.
+- In half of the steps, `slot` is the lowest alive slot in which `v` has not
+  voted (`frontierSlots`), and a uniform alive slot otherwise.
+- A timeout may only fire in one step in four.
+- A block delivery that can only repeat an earlier one (`v` voted in the slot,
+  or every block of the slot is already pending at `v`) may only happen in one
+  step in four. `step` inlines the branches of `messageResponse` to gate
+  `receiveBlock`.
+
+`any` picks among the enabled branches, so the gating makes these steps rarer
+without disabling `step`, and every interleaving stays possible. `consensus`,
+the actions, and `noTimeout` are unchanged. The change applies to every
+instance. The witnesses measure the scheduler without the model-based tests,
+for example `quint run statemachine.qnt --main=agave_gen --init=initGenerated
+--max-steps=60 --witnesses notarizedInWindow1 parentReadySlot4
+notarFallbackVoted skipFallbackVoted slotFinalized`.
+
+### Patch 10: the Byzantine soup skips votes for other slots' generated hashes
+
+`statemachine.qnt` (`isGenHashOfOtherSlot`, `byzSoup`, `allMessages`).
+
+Not a fix, and not to be reported upstream. `byzNetworkMsgs` pairs every alive
+slot with every alive hash, so in `agave_gen` it has Byzantine notar and
+notar-fallback votes for 192 block references, of which only the 24 whose
+`genHash` (patch 8) encodes their own slot can name a block. `allMessages`
+now reads `byzSoup`, which leaves out the other 168. No certificate or
+condition on a trace block changes, since each slot keeps the Byzantine votes
+for its own three hashes (this also keeps `safeToSkipCondition` unchanged).
+The generated traces are identical with and without the patch (checked on
+several seeds), and `quint run` on `agave_gen` is about three times faster.
+For the fixed instances, whose hashes are below 100, `byzSoup` is
+`byzNetworkMsgs`.
+
+### Patch 11: `isDescendant` walks the slots in ascending order
+
+`alpenglow.qnt` (`isDescendant`).
+
+`isDescendant(a, b, blocks)` collects the descendants of `b` slot by slot:
+a block of slot `s` joins the path if its parent is already in it. That only
+works if the slots are visited in ascending order, but upstream folds over
+the set `b.slot.to(a.slot)`, and `quint run`'s Rust backend folds over a set
+in no particular order (`0.to(9).fold([], (l, e) => l.append(e))` gives
+`[0, 8, 5, 2, 7, 4, 1, 9, 6, 3]` on quint 0.33.0). So `isDescendant` could
+miss a descendant more than one block away, and `--invariant=safety` failed on
+`agave_gen` traces that finalize a block and its grandchild (for example
+100 in slot 0 and 150 in slot 5, via 140 in slot 4). The patch folds over the
+list `range(b.slot, a.slot + 1)` with `foldl`. `safety` is only an
+invariant, and neither `consensus` nor the model-based tests read
+`isDescendant`, so the patch changes no trace. The bug is upstream too,
+wherever a block and a descendant two or more blocks down are both finalized,
+and is to be reported upstream.
 
 ### Addition: the `agave_window` instance
 

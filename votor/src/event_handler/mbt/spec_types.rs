@@ -32,6 +32,19 @@ pub(super) enum Message {
     FinalVoteMsg(i64),
 }
 
+impl Message {
+    /// The name of the spec's constructor.
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Message::NotarVoteMsg(_) => "NotarVoteMsg",
+            Message::NotarFallBackVoteMsg(_) => "NotarFallBackVoteMsg",
+            Message::SkipVoteMsg(_) => "SkipVoteMsg",
+            Message::SkipFallbackVoteMsg(_) => "SkipFallbackVoteMsg",
+            Message::FinalVoteMsg(_) => "FinalVoteMsg",
+        }
+    }
+}
+
 /// Mirror of the spec's `NetworkMsg`.
 #[derive(Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) struct NetworkMsg {

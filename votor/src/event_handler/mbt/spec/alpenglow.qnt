@@ -223,7 +223,9 @@ module alpenglow {
     // Filter by minimal slot
     // The slot of the parent will always be smaller then that of the child
     // but its not in increments of 1 like in mysticeti
-    pure val bAncestors = (b.slot.to(a.slot)).fold(Set(b.hash), (path, s) =>
+    // agave patch 11: walks the slots in ascending order, which the walk relies on (upstream:
+    // `b.slot.to(a.slot).fold`, whose order the Rust backend does not keep ascending).
+    pure val bAncestors = range(b.slot, a.slot + 1).foldl(Set(b.hash), (path, s) =>
       pure val potentialAncestors = blocks.filter(block => block.slot == s)
       pure val ancestors = potentialAncestors.filter(ancestor =>
         path.exists(h => ancestor.parent == h)
