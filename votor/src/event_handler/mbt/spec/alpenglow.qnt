@@ -40,6 +40,10 @@ module alpenglow {
     | BlockNotarized(Blockhash)
     | ItsOver
     | BadWindow
+    // agave patch 5: records the fallback votes cast in a slot, so that each is cast at most
+    // once per block (notar-fallback) or slot (skip-fallback), as agave's `VoteHistory` does.
+    | VotedNotarFallback(Blockhash)
+    | VotedSkipFallback
 
   type ConsensusInput =
     | BlockInput(Block)
@@ -324,8 +328,10 @@ module alpenglow {
         { result: { post: ls, output: Set() }, success: false }
 
   pure def tryFinal(ls: LocalState, slot: Slot, hash: Blockhash): Result =
+    // agave patch 6: also requires `not(ItsOver)`, so that the finalization vote is cast at
+    // most once, as in agave's `try_final`.
     if (BlockNotarized(hash).in(ls.state[slot]) and VotedNotar(hash).in(ls.state[slot])
-        and not(BadWindow.in(ls.state[slot])))
+        and not(BadWindow.in(ls.state[slot])) and not(ItsOver.in(ls.state[slot])))
       // Finalization vote
       { output: Set(Broadcast(FinalVoteMsg(slot))), post: ls.addObjects(slot, Set(ItsOver)) }
     else
@@ -395,19 +401,23 @@ module alpenglow {
 
       | SafeToNotarInput(sh) =>
         val s1 = trySkipWindow(ls, sh.slot)
-        if (not(ItsOver.in(s1.post.state[sh.slot])))
+        // agave patch 5: at most one notar-fallback vote per block.
+        if (not(ItsOver.in(s1.post.state[sh.slot]))
+            and not(VotedNotarFallback(sh.hash).in(s1.post.state[sh.slot])))
           // Notar-fallback vote
           val output = s1.output.union(Set(Broadcast(NotarFallBackVoteMsg(sh))))
-          { output: output, post: s1.post.addObjects(sh.slot, Set(BadWindow)) }
+          { output: output,
+            post: s1.post.addObjects(sh.slot, Set(BadWindow, VotedNotarFallback(sh.hash))) }
         else
           s1
 
       | SafeToSkipInput(slot) =>
         val s1 = trySkipWindow(ls, slot)
-        if (not(ItsOver.in(s1.post.state[slot])))
+        // agave patch 5: at most one skip-fallback vote per slot.
+        if (not(ItsOver.in(s1.post.state[slot])) and not(VotedSkipFallback.in(s1.post.state[slot])))
           // Skip-fallback vote
           val output = s1.output.union(Set(Broadcast(SkipFallbackVoteMsg(slot))))
-          { output: output, post: addObjects(s1.post, slot, Set(BadWindow)) }
+          { output: output, post: addObjects(s1.post, slot, Set(BadWindow, VotedSkipFallback)) }
         else
           s1
     }

@@ -7,7 +7,8 @@
 //!   agave reports for children of the genesis bank. Every other spec hash `h` maps to a fixed,
 //!   distinct `Hash`.
 //! - Spec blocks are turned into frozen banks that are never inserted into `BankForks`.
-//! - Votes map back onto spec messages through the inverses of the slot and hash mappings.
+//! - Votes and agave's pending blocks map back onto spec values through the inverses of the slot
+//!   and hash mappings.
 
 use {
     super::spec_types::{BlockRef, Message},
@@ -24,7 +25,7 @@ use {
 pub(super) const OFFSET: Slot = 4;
 
 /// Spec hash of the (implicit) parent of the first block.
-const GENESIS_HASH: i64 = -1;
+pub(super) const GENESIS_HASH: i64 = -1;
 
 /// Maps a spec slot onto an agave slot.
 pub(super) fn agave_slot(s: i64) -> Slot {
@@ -86,6 +87,16 @@ pub(super) fn to_spec_message(vote: &Vote) -> Result<Message> {
         Vote::SkipFallback(vote) => Message::SkipFallbackVoteMsg(spec_slot(vote.slot)?),
         Vote::Finalize(vote) => Message::FinalVoteMsg(spec_slot(vote.slot)?),
         Vote::Genesis(_) => bail!("genesis votes have no spec counterpart: {vote:?}"),
+    })
+}
+
+/// Maps a block that agave keeps pending, together with the parent agave read from its bank,
+/// back onto the spec block it was built from.
+pub(super) fn to_spec_block(block: &Block, parent: &Block) -> Result<SpecBlock> {
+    Ok(SpecBlock {
+        slot: spec_slot(block.slot)?,
+        hash: spec_hash(&block.block_id)?,
+        parent: spec_hash(&parent.block_id)?,
     })
 }
 

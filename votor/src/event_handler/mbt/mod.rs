@@ -17,22 +17,62 @@
 //! QUINT_VERBOSE=1 cargo nextest run -p agave-votor --run-ignored ignored-only mbt --no-capture
 //! ```
 //!
-//! # Scope
+//! # What is checked
 //!
-//! Only the event handler is under test. The environment's decisions (certificates, parent-ready,
-//! safe-to-notar, safe-to-skip, and which timeouts fire) come from the trace, so the consensus
-//! pool and the timer manager are trusted, not checked. Agave-only events (`FirstShred`,
-//! `TimeoutCrashedLeader`, `BlockNotarFallback`, `ProduceWindow`, `Finalized`, `Standstill`,
-//! `SetIdentity`) are never sent.
+//! Only the event handler is under test. Replaying a trace checks that:
 //!
-//! Replaying a trace checks that `handle_event` neither fails nor panics (for example on a
-//! `VoteHistory` equivocation assert), that it only emits `BLSOp::PushVote`, and that a timer is
-//! set after every `ParentReady`. After every step, the votes pushed by all nodes since `init`
-//! must equal the spec's `msgBuffer`. The nodes' per-slot state is not yet compared with the
-//! spec's `system`.
+//! - `handle_event` neither fails nor panics (for example on a `VoteHistory` equivocation
+//!   assert), and only emits `BLSOp::PushVote`;
+//! - a timer is set for the slot of every `ParentReady`;
+//! - no node pushes a vote it already pushed since `init`. The spec's `msgBuffer` is a set, so a
+//!   repeated vote would otherwise go unnoticed; with spec patches 5 and 6 a correct spec process
+//!   never broadcasts the same message twice either.
+//!
+//! After every step, the driver's projection of agave's state must equal the spec's environment
+//! variable `s`, restricted to:
+//!
+//! - `msgBuffer`: the votes pushed by all nodes since `init`;
+//! - `system`: for every benevolent process and every spec slot, the `VoteHistory` flags (voted,
+//!   voted-notar, block-notarized, parent-ready, its-over, bad-window, notar-fallback voted,
+//!   skip-fallback voted) and `LocalContext::pending_blocks` in arrival order.
+//!
+//! # Trusted, not checked
+//!
+//! - The consensus pool. Certificates, parent-ready, safe-to-notar, and safe-to-skip are decided
+//!   by the spec's environment over its message soup (which includes every possible Byzantine
+//!   vote) and injected as events. Agave's pool-side behavior, such as deferring intra-window
+//!   `SafeToNotar` until the parent is verified and emitting each derived event once, is not
+//!   exercised.
+//! - The timer manager. The spec's `activeTimeouts` is a set of slots that may fire in any order,
+//!   while agave arms one two-phase timer per window that fires in slot order by wall-clock
+//!   time. `activeTimeouts` is not compared. Instead `fireTimeoutEvent` injects `Timeout`
+//!   directly, and each `ParentReady` must leave a timer set for its slot.
+//! - The spec's `ch` (finalized chain) and `counter` (trace bound), which are environment
+//!   bookkeeping.
+//! - Agave-only events, which are never sent: `FirstShred`, `TimeoutCrashedLeader`,
+//!   `BlockNotarFallback`, `ProduceWindow`, `Finalized`, `Standstill`, and `SetIdentity`. With no
+//!   `Finalized` event the root stays at genesis, so rooting and root-based pruning are never
+//!   reached.
+//! - Agave state without a spec counterpart: `VoteHistory`'s `skipped` set (only visible through
+//!   `bad_window`), `votes_cast`, and root; `LocalContext`'s finalized blocks, received shreds,
+//!   and standstill slot; commitment, repair, metrics, reward, and persistence side effects (vote
+//!   history storage is `NullVoteHistoryStorage`).
+//! - Agave's `slot == 1` special case for the first leader window, which the slot offset keeps
+//!   out of reach (see `mapping.rs`).
+//!
+//! # Spec patches
 //!
 //! The vendored spec is patched where agave's behavior is the intended one, and extended with the
-//! agave-specific `agave_window` instance. `spec/README.md` lists every patch.
+//! agave-specific `agave_window` instance. `spec/README.md` describes every patch:
+//!
+//! 1. Pending blocks are a per-slot list, tried in arrival order, as in agave.
+//! 2. `parentReadyAction` requires skip certificates only for the slots strictly between the
+//!    parent and the ready slot, and records `ParentReady` at the ready slot.
+//! 3. Per-process lists cover every window that has an alive slot.
+//! 4. The initial `ParentReady` starts the timeouts of its whole window.
+//! 5. `VotedNotarFallback(hash)` and `VotedSkipFallback` record fallback votes, which are cast at
+//!    most once per block or slot, as in agave.
+//! 6. `tryFinal` requires `not(ItsOver)`, as agave's `try_final` does.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
@@ -41,8 +81,11 @@ mod spec_types;
 
 use {
     self::{
-        mapping::{Banks, OFFSET, SpecBlock, agave_slot, block_ref, to_spec_message},
-        spec_types::{NetworkMsg, SpecState},
+        mapping::{
+            Banks, GENESIS_HASH, OFFSET, SpecBlock, agave_slot, block_ref, hash_of, spec_hash,
+            spec_slot, to_spec_block, to_spec_message,
+        },
+        spec_types::{LocalState, NetworkMsg, SlotObject, SpecState},
     },
     super::{
         EventHandler,
@@ -78,6 +121,9 @@ trait Instance {
     /// The instance's `correctBlocks` and `byzantineBlocks`. Every block picked by a trace must
     /// be listed, and a block's parent is built from this list when it is one of its blocks.
     const BLOCKS: &'static [SpecBlock];
+    /// The instance's `numSlots` (agave patch 3): the length of every per-slot list in a
+    /// process's `LocalState`.
+    const NUM_SLOTS: usize;
 }
 
 /// Blocks of the `some_byz` and `some_byz_vp` instances.
@@ -105,6 +151,7 @@ impl Instance for SomeByz {
         ("b1", 1, false),
     ];
     const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
+    const NUM_SLOTS: usize = 4;
 }
 
 /// The `some_byz_vp` instance: two correct processes and one Byzantine process, with different
@@ -116,6 +163,7 @@ impl Instance for SomeByzVp {
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
     const BLOCKS: &'static [SpecBlock] = UPSTREAM_BLOCKS;
+    const NUM_SLOTS: usize = 4;
 }
 
 /// The agave-specific `agave_window` instance, whose slot 4 starts a second leader window, so
@@ -134,6 +182,7 @@ impl Instance for AgaveWindow {
         SpecBlock::new(1, 46, 42),
         SpecBlock::new(4, 52, 45),
     ];
+    const NUM_SLOTS: usize = 8;
 }
 
 /// Replays spec traces against one event handler per benevolent spec process.
@@ -256,10 +305,18 @@ impl<I: Instance> VotorMbtDriver<I> {
             match op {
                 BLSOp::PushVote { vote } => {
                     self.stats.votes = self.stats.votes.saturating_add(1);
-                    self.msg_buffer.insert(NetworkMsg {
+                    let msg = NetworkMsg {
                         sender: v.to_string(),
                         msg: to_spec_message(&vote.vote)?,
-                    });
+                    };
+                    // `msgBuffer` is a set, so a repeated vote is invisible to the state
+                    // comparison. With agave patches 5 and 6 a correct spec process never
+                    // broadcasts the same message twice, and neither should agave.
+                    ensure!(
+                        !self.msg_buffer.contains(&msg),
+                        "{description}: pushed {msg:?} again"
+                    );
+                    self.msg_buffer.insert(msg);
                 }
                 BLSOp::PushCertificates { .. }
                 | BLSOp::RefreshVotes { .. }
@@ -280,10 +337,101 @@ impl<I: Instance> VotorMbtDriver<I> {
 
 impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
     fn from_driver(driver: &VotorMbtDriver<I>) -> Result<Self> {
+        let system = driver
+            .nodes
+            .iter()
+            .map(|(v, node)| Ok((v.clone(), project_local_state::<I>(v, node)?)))
+            .collect::<Result<_>>()?;
         Ok(SpecState {
+            system,
             msg_buffer: driver.msg_buffer.clone(),
         })
     }
+}
+
+/// Projects a node's `VoteHistory` and pending blocks onto the spec's `LocalState`, for spec
+/// slots `0..I::NUM_SLOTS`.
+///
+/// `VoteHistory` is queried through its accessors, so the flags that carry a hash are probed with
+/// every hash of the instance (its blocks and their parents, plus the genesis hash). Every hash
+/// agave sees comes from one of these, since the driver builds every event from the instance's
+/// blocks.
+fn project_local_state<I: Instance>(v: &str, node: &Node) -> Result<LocalState> {
+    let vote_history = &node.voting_context.vote_history;
+    let hashes: BTreeSet<i64> = I::BLOCKS
+        .iter()
+        .flat_map(|b| [b.hash, b.parent])
+        .chain([GENESIS_HASH])
+        .collect();
+    // The agave block a spec `ParentReady(h)` refers to. Only blocks of the instance (and the
+    // genesis block) can become parent-ready in the spec.
+    let parent_ref = |h: i64| {
+        if h == GENESIS_HASH {
+            Some(Block::default())
+        } else {
+            I::BLOCKS
+                .iter()
+                .find(|b| b.hash == h)
+                .map(|b| block_ref(b.slot, h))
+        }
+    };
+
+    let mut state = Vec::with_capacity(I::NUM_SLOTS);
+    for s in 0..I::NUM_SLOTS {
+        let s = i64::try_from(s).expect("few slots");
+        let a = agave_slot(s);
+        let mut objects = BTreeSet::new();
+        if vote_history.voted(a) {
+            objects.insert(SlotObject::Voted);
+        }
+        if let Some(hash) = vote_history.voted_notar(a) {
+            objects.insert(SlotObject::VotedNotar(spec_hash(&hash)?));
+        }
+        if vote_history.its_over(a) {
+            objects.insert(SlotObject::ItsOver);
+        }
+        if vote_history.bad_window(a) {
+            objects.insert(SlotObject::BadWindow);
+        }
+        if vote_history.voted_skip_fallback(a) {
+            objects.insert(SlotObject::VotedSkipFallback);
+        }
+        for &h in &hashes {
+            let block = Block {
+                slot: a,
+                block_id: hash_of(h),
+            };
+            if vote_history.is_block_notarized(&block) {
+                objects.insert(SlotObject::BlockNotarized(h));
+            }
+            if vote_history.voted_notar_fallback(a, hash_of(h)) {
+                objects.insert(SlotObject::VotedNotarFallback(h));
+            }
+            if parent_ref(h).is_some_and(|parent| vote_history.is_parent_ready(a, &parent)) {
+                objects.insert(SlotObject::ParentReady(h));
+            }
+        }
+        state.push(objects);
+    }
+
+    let mut pending_blocks = vec![Vec::new(); I::NUM_SLOTS];
+    for (&slot, blocks) in &node.local_context.pending_blocks {
+        let pending = usize::try_from(spec_slot(slot)?)
+            .ok()
+            .and_then(|s| pending_blocks.get_mut(s))
+            .ok_or_else(|| {
+                anyhow!("{v}: pending blocks at agave slot {slot}, beyond the spec's")
+            })?;
+        *pending = blocks
+            .iter()
+            .map(|(block, parent)| to_spec_block(block, parent))
+            .collect::<Result<_>>()?;
+    }
+
+    Ok(LocalState {
+        pending_blocks,
+        state,
+    })
 }
 
 impl<I: Instance> Driver for VotorMbtDriver<I> {
@@ -354,7 +502,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "some_byz",
-    max_samples = 30
+    max_samples = 100
 )]
 fn mbt_votor_some_byz() -> impl Driver {
     VotorMbtDriver::<SomeByz>::new()
@@ -367,7 +515,7 @@ fn mbt_votor_some_byz() -> impl Driver {
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",
     main = "some_byz_vp",
-    max_samples = 30
+    max_samples = 100
 )]
 fn mbt_votor_some_byz_vp() -> impl Driver {
     VotorMbtDriver::<SomeByzVp>::new()

@@ -16,7 +16,7 @@ does not typecheck at the upstream commit.
 
 Every change to the vendored files is listed here, with the reason for it.
 Each changed spot is marked with an `agave patch N` comment. Patches 1, 2,
-and 4 are to be reported upstream.
+4, 5, and 6 are to be reported upstream.
 
 ### Patch 1: pending blocks are a per-slot list, tried in arrival order
 
@@ -77,6 +77,36 @@ parent-ready. Measured over 200 traces with a fixed seed, the patch raises
 the traces that reach `parentReadyAction` from 1 to 15. It also changes the
 mix of actions in the upstream instances (more `fireTimeoutEvent`, fewer
 `receiveBlock`).
+
+### Patch 5: fallback votes are recorded and cast at most once
+
+`alpenglow.qnt` (`SlotObject`, `consensus` on `SafeToNotarInput` and
+`SafeToSkipInput`).
+
+Upstream's `SafeToNotarInput(sh)` and `SafeToSkipInput(slot)` only check
+`ItsOver` before broadcasting the fallback vote, so a repeated input
+broadcasts it again. Agave also skips the vote when its `VoteHistory` records
+that it already voted notar-fallback for that block
+(`voted_notar_fallback(slot, block_id)`) or skip-fallback for that slot
+(`voted_skip_fallback(slot)`). The patch adds the `SlotObject` variants
+`VotedNotarFallback(Blockhash)` and `VotedSkipFallback`, requires their
+absence before broadcasting, and adds them (together with `BadWindow`) when
+the vote is cast. The model-based tests compare both flags with agave's
+`VoteHistory`.
+
+### Patch 6: `tryFinal` requires `not(ItsOver)`
+
+`alpenglow.qnt` (`tryFinal`).
+
+Upstream's `tryFinal` broadcasts `FinalVoteMsg(slot)` whenever the block is
+notarized, voted on, and the window is not bad, so every repeated
+`BlockNotarizedInput` broadcasts it again. Agave's `try_final` also requires
+`!its_over(slot)`, so it votes to finalize at most once. The patch adds the
+same condition.
+
+Neither patch changes the set of broadcast messages, since `msgBuffer` is a
+set. With both, a correct process never broadcasts the same message twice,
+which the model-based tests check on the agave side.
 
 ### Addition: the `agave_window` instance
 
