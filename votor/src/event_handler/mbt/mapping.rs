@@ -123,6 +123,11 @@ pub(super) struct SpecBlock {
     pub(super) parent: i64,
 }
 
+/// A block together with its ancestors among a trace's blocks, youngest first. The last block's
+/// parent is genesis or a phantom, so the key determines the whole bank chain, and a bank built
+/// for one trace can be reused by any later trace whose tree contains the same chain.
+type Ancestry = Vec<SpecBlock>;
+
 /// Frozen banks for the blocks of the current trace, built at `init` from the trace's block set.
 pub(super) struct Banks {
     genesis: Arc<Bank>,
@@ -130,6 +135,9 @@ pub(super) struct Banks {
     blocks: BTreeSet<SpecBlock>,
     /// The bank of every block in `blocks`, keyed by its spec hash.
     by_hash: HashMap<i64, Arc<Bank>>,
+    /// Every bank built so far, across traces. Generated trees share most of their chains, and
+    /// building a bank takes milliseconds.
+    cache: HashMap<Ancestry, Arc<Bank>>,
 }
 
 impl Banks {
@@ -139,12 +147,13 @@ impl Banks {
             genesis,
             blocks: BTreeSet::new(),
             by_hash: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
 
     /// Makes `blocks` the trace's block set, and builds a frozen bank for each of them, with
-    /// `slot = agave_slot(block.slot)` and `block_id = hash_of(block.hash)`. Keeps the existing
-    /// banks if `blocks` equals the previous trace's set.
+    /// `slot = agave_slot(block.slot)` and `block_id = hash_of(block.hash)`. Reuses the bank built
+    /// for an earlier trace if the block and all its ancestors are the same.
     ///
     /// Blocks are built in slot order. A block's parent bank is:
     /// - the genesis bank, if `block.parent` is the genesis hash;
@@ -177,27 +186,48 @@ impl Banks {
 
         // `SpecBlock` orders by slot first, so every parent in `blocks` is built before its
         // children.
+        let mut ancestries: HashMap<i64, Ancestry> = HashMap::with_capacity(blocks.len());
         let mut banks: HashMap<i64, Arc<Bank>> = HashMap::with_capacity(blocks.len());
         for block in &blocks {
-            let slot = agave_slot(block.slot);
-            let parent = if block.parent == GENESIS_HASH {
-                self.genesis.clone()
-            } else if let Some(parent) = by_hash.get(&block.parent) {
+            let parent = by_hash.get(&block.parent);
+            if let Some(parent) = parent {
                 ensure!(
                     parent.slot < block.slot,
                     "parent {parent:?} of {block:?} is not in an earlier slot"
                 );
-                banks
-                    .get(&parent.hash)
-                    .expect("blocks of earlier slots are built first")
-                    .clone()
-            } else {
-                let phantom_slot = slot
-                    .checked_sub(1)
-                    .expect("agave slots of spec blocks are positive");
-                frozen_bank(self.genesis.clone(), phantom_slot, hash_of(block.parent))
+            }
+            let mut ancestry = vec![*block];
+            if let Some(parent) = parent {
+                ancestry.extend_from_slice(
+                    ancestries
+                        .get(&parent.hash)
+                        .expect("blocks of earlier slots are handled first"),
+                );
+            }
+            let bank = match self.cache.get(&ancestry) {
+                Some(bank) => bank.clone(),
+                None => {
+                    let slot = agave_slot(block.slot);
+                    let parent_bank = if block.parent == GENESIS_HASH {
+                        self.genesis.clone()
+                    } else if let Some(parent) = parent {
+                        banks
+                            .get(&parent.hash)
+                            .expect("blocks of earlier slots are built first")
+                            .clone()
+                    } else {
+                        let phantom_slot = slot
+                            .checked_sub(1)
+                            .expect("agave slots of spec blocks are positive");
+                        frozen_bank(self.genesis.clone(), phantom_slot, hash_of(block.parent))
+                    };
+                    let bank = frozen_bank(parent_bank, slot, hash_of(block.hash));
+                    self.cache.insert(ancestry.clone(), bank.clone());
+                    bank
+                }
             };
-            banks.insert(block.hash, frozen_bank(parent, slot, hash_of(block.hash)));
+            ancestries.insert(block.hash, ancestry);
+            banks.insert(block.hash, bank);
         }
 
         self.blocks = blocks;

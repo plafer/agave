@@ -5,8 +5,9 @@
 //! [`EventHandlerTestContext`], and each spec action becomes exactly one [`VotorEvent`] passed to
 //! [`EventHandler::handle_event`] for the process that took the step. The driver has no copy of
 //! the instance's blocks: each trace's `init` step picks the trace's block set, and the driver
-//! builds a bank for each block from that pick. See `mapping.rs` for how spec slots, hashes, and
-//! blocks map onto agave values.
+//! builds a bank for each block from that pick. In the `agave_gen` instance that set is a block
+//! tree drawn anew for every trace (spec patch 8). See `mapping.rs` for how spec slots, hashes,
+//! and blocks map onto agave values.
 //!
 //! # Running
 //!
@@ -65,7 +66,8 @@
 //! # Spec patches
 //!
 //! The vendored spec is patched where agave's behavior is the intended one, and extended with the
-//! agave-specific `agave_window` instance. `spec/README.md` describes every patch:
+//! agave-specific `agave_window` and `agave_gen` instances. `spec/README.md` describes every
+//! patch:
 //!
 //! 1. Pending blocks are a per-slot list, tried in arrival order, as in agave.
 //! 2. `parentReadyAction` requires skip certificates only for the slots strictly between the
@@ -76,6 +78,7 @@
 //!    most once per block or slot, as in agave.
 //! 6. `tryFinal` requires `not(ItsOver)`, as agave's `try_final` does.
 //! 7. The block set is part of the environment, and `init` exposes it as a nondet pick.
+//! 8. `initGenerated` draws a block tree per trace, for the `agave_gen` instance.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
@@ -164,6 +167,21 @@ impl Instance for AgaveWindow {
     const NUM_SLOTS: usize = 8;
 }
 
+/// The agave-specific `agave_gen` instance, run with `initGenerated`: every trace draws its own
+/// block tree over two leader windows (spec patch 8).
+struct AgaveGen;
+
+impl Instance for AgaveGen {
+    const STATE_PATH: Path = &["agave_gen::consensus::s"];
+    const PROCESSES: &'static [(&'static str, u64, bool)] = &[
+        ("v1", 3, true),
+        ("v2", 2, true),
+        ("v3", 2, true),
+        ("b1", 1, false),
+    ];
+    const NUM_SLOTS: usize = 8;
+}
+
 /// Replays spec traces against one event handler per benevolent spec process.
 struct VotorMbtDriver<I: Instance> {
     /// Kept alive for the banks and blockstore the nodes share.
@@ -182,6 +200,79 @@ struct VotorMbtDriver<I: Instance> {
 struct ReplayStats {
     actions: BTreeMap<String, usize>,
     votes: usize,
+    traces: usize,
+    /// Number of traces whose block tree has each shape.
+    tree_shapes: BTreeMap<TreeShape, usize>,
+}
+
+impl ReplayStats {
+    fn record_tree(&mut self, blocks: &BTreeSet<SpecBlock>, num_slots: usize) {
+        self.traces = self.traces.saturating_add(1);
+        for shape in TreeShape::of(blocks, num_slots) {
+            let count = self.tree_shapes.entry(shape).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+/// Shapes of a trace's block tree that [`ReplayStats`] counts. They are computed from the
+/// `blocks` pick of `init`, not from the generator's own picks, so that the driver does not
+/// depend on the generator's vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum TreeShape {
+    /// Two blocks in one slot: an equivocation, and a fork if their parents differ.
+    Equivocation,
+    /// A parent that is neither genesis nor one of the trace's blocks.
+    PhantomParent,
+    /// A parent block more than one slot back.
+    FarParent,
+    /// The genesis parent for a block after slot 0.
+    LateGenesisParent,
+    /// A spec slot without a block.
+    EmptySlot,
+}
+
+impl TreeShape {
+    const ALL: [TreeShape; 5] = [
+        TreeShape::Equivocation,
+        TreeShape::PhantomParent,
+        TreeShape::FarParent,
+        TreeShape::LateGenesisParent,
+        TreeShape::EmptySlot,
+    ];
+
+    /// The shapes of the tree `blocks`, whose slots are in `0..num_slots`.
+    fn of(blocks: &BTreeSet<SpecBlock>, num_slots: usize) -> BTreeSet<TreeShape> {
+        let slot_of: BTreeMap<i64, i64> = blocks.iter().map(|b| (b.hash, b.slot)).collect();
+        let mut per_slot: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut shapes = BTreeSet::new();
+        for block in blocks {
+            let count = per_slot.entry(block.slot).or_default();
+            *count = count.saturating_add(1);
+            if *count > 1 {
+                shapes.insert(TreeShape::Equivocation);
+            }
+            let shape = if block.parent == GENESIS_HASH {
+                (block.slot > 0).then_some(TreeShape::LateGenesisParent)
+            } else {
+                match slot_of.get(&block.parent) {
+                    None => Some(TreeShape::PhantomParent),
+                    Some(&parent_slot) => {
+                        (parent_slot < block.slot.saturating_sub(1)).then_some(TreeShape::FarParent)
+                    }
+                }
+            };
+            shapes.extend(shape);
+        }
+        let empty_slot = (0..num_slots).any(|s| {
+            let s = i64::try_from(s).expect("few slots");
+            !per_slot.contains_key(&s)
+        });
+        if empty_slot {
+            shapes.insert(TreeShape::EmptySlot);
+        }
+        shapes
+    }
 }
 
 impl<I: Instance> VotorMbtDriver<I> {
@@ -211,6 +302,7 @@ impl<I: Instance> VotorMbtDriver<I> {
     /// Spec `init`: the trace's blocks are `blocks`, and every benevolent process starts with
     /// `ParentReady(-1)` at slot 0.
     fn init(&mut self, blocks: BTreeSet<SpecBlock>) -> Result {
+        self.stats.record_tree(&blocks, I::NUM_SLOTS);
         self.banks.reset(blocks)?;
         self.msg_buffer.clear();
         let ids: Vec<String> = self.nodes.keys().cloned().collect();
@@ -440,6 +532,7 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
         *count = count.saturating_add(1);
         switch!(step {
             init(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
+            initGenerated(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
             receiveBlock(v: String, block: SpecBlock) => self.receive_block(&v, block)?,
             fireTimeoutEvent(v: String, slot: i64) => self.fire_timeout(&v, slot)?,
             blockNotarizedAction(v: String, b: SpecBlock) => self.block_notarized(&v, b)?,
@@ -454,10 +547,25 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
 
 impl<I: Instance> Drop for VotorMbtDriver<I> {
     fn drop(&mut self) {
-        let ReplayStats { actions, votes } = &self.stats;
+        let ReplayStats {
+            actions,
+            votes,
+            traces,
+            tree_shapes,
+        } = &self.stats;
+        let tree_shapes: Vec<String> = TreeShape::ALL
+            .iter()
+            .map(|shape| {
+                let count = tree_shapes.get(shape).copied().unwrap_or_default();
+                let percent = count.saturating_mul(100).checked_div(*traces).unwrap_or(0);
+                format!("{shape:?} {count} ({percent}%)")
+            })
+            .collect();
         eprintln!(
-            "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}",
-            I::STATE_PATH.join(".")
+            "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}, traces {traces}, \
+             traces whose block tree has: {}",
+            I::STATE_PATH.join("."),
+            tree_shapes.join(", "),
         );
     }
 }
@@ -509,4 +617,20 @@ fn mbt_votor_some_byz_vp() -> impl Driver {
 )]
 fn mbt_votor_agave_window() -> impl Driver {
     VotorMbtDriver::<AgaveWindow>::new()
+}
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+///
+/// Every trace starts from its own generated block tree (spec patch 8).
+#[ignore]
+#[quint_run(
+    spec = "src/event_handler/mbt/spec/statemachine.qnt",
+    main = "agave_gen",
+    init = "initGenerated",
+    max_samples = 200
+)]
+fn mbt_votor_agave_gen() -> impl Driver {
+    VotorMbtDriver::<AgaveGen>::new()
 }

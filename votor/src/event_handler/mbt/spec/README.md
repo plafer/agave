@@ -132,6 +132,41 @@ so this pick is how the driver learns each trace's blocks, and it no longer
 keeps its own copy of them. This prepares for instances that generate a
 different block set per trace.
 
+### Patch 8: a block generator and the `agave_gen` instance
+
+`statemachine.qnt` (`genHash`, `latestPrimaries`, `primaryParent`,
+`generateBlocks`, `initGenerated`, module `agave_gen`).
+
+Not a fix, and not to be reported upstream. `initGenerated` is an alternative
+`init` that draws a different block tree for every trace. It picks two maps
+from slot to int, `kind` and `equiv`, and `generateBlocks(kind, equiv)`, a
+pure function of the two, turns them into the block set passed to
+`initWith`. `oneOf` is uniform, so the size of each range sets the weights.
+Per slot:
+
+- `kind` in `0..9`: 0 to 5 give the primary block an honest parent (the
+  primary block of the latest earlier slot that has one), 6 is a crashed
+  leader (no block), 7 a phantom parent that is never a block, 8 a parent
+  further back (the primary block of the second-latest earlier slot that has
+  one), and 9 the genesis parent.
+- `equiv` in `0..7`: 0 adds an equivocating block with the same parent as the
+  primary block, 1 one with a different parent, and 2 to 7 nothing.
+
+Hashes encode their slot: `genHash(slot, lane) = 100 + 10 * slot + lane`,
+with lane 0 for the primary block, 1 for the equivocating block, and 9 for
+phantom parents. The resulting trees have forks, equivocations, phantom,
+far-back, and genesis parents, and empty slots. Parents are fixed before the
+trace starts, so an "honest" parent only approximates what an honest leader
+would choose from its own `ParentReady`.
+
+`agave_gen` has three correct processes (stakes 3, 2, 2), one Byzantine
+process (stake 1), and slots 0..7, so slot 4 starts a second leader window.
+Its `correctBlocks` and `byzantineBlocks` are empty, so it must be run with
+`--init=initGenerated`. Its `aliveHashes` are every hash the generator can
+use, so the Byzantine message soup does not depend on the trace's tree. The
+`blocks` pick is still how the model-based tests learn the tree; they never
+read `kind` or `equiv`. `consensus` in `alpenglow.qnt` is untouched.
+
 ### Addition: the `agave_window` instance
 
 `statemachine.qnt`.

@@ -87,6 +87,66 @@ module consensus {
     initWith(blocks)
   }
 
+  //
+  // agave patch 8: a block generator, for instances that draw a different block tree per trace.
+  // Everything below is a pure function of `initGenerated`'s picks.
+  //
+
+  /// agave patch 8: the hash of the block of `slot` in `lane`. Lane 0 is the slot's primary
+  /// block, lane 1 an equivocating second block, and lane 9 a phantom parent that is never a
+  /// block itself. Every generated hash is distinct and encodes its slot.
+  pure def genHash(slot: Slot, lane: int): Blockhash = 100 + 10 * slot + lane
+
+  /// agave patch 8: the hashes of the primary blocks of the latest and the second-latest slot
+  /// before `slot` that have one, or -1 (the genesis parent) where there is none.
+  pure def latestPrimaries(kind: Slot -> int, slot: Slot): (Blockhash, Blockhash) =
+    range(0, slot).foldl((-1, -1), (acc, earlier) =>
+      if (kind.keys().contains(earlier) and kind.get(earlier) != 6) (genHash(earlier, 0), acc._1)
+      else acc
+    )
+
+  /// agave patch 8: the parent of the primary block of `slot`, by `kind.get(slot)`:
+  /// - 0..5, honest: the primary block of the latest earlier slot that has one (or genesis);
+  /// - 7, phantom: `genHash(slot - 1, 9)`, which is never a block (genesis at slot 0);
+  /// - 8, far back: the primary block of the second-latest earlier slot that has one (or genesis);
+  /// - 9, genesis.
+  /// Kind 6 is a crashed leader: the slot has no block.
+  pure def primaryParent(kind: Slot -> int, slot: Slot): Blockhash =
+    val k = kind.get(slot)
+    val latest = latestPrimaries(kind, slot)
+    if (k <= 5) latest._1
+    else if (k == 7) (if (slot == 0) -1 else genHash(slot - 1, 9))
+    else if (k == 8) latest._2
+    else -1
+
+  /// agave patch 8: the block tree drawn by `initGenerated`. Every slot of `kind` whose leader
+  /// did not crash has a primary block (see `primaryParent`). By `equiv.get(slot)`, it also has
+  /// an equivocating block with the same parent (0), or with a different parent (1): the honest
+  /// one if the primary's is not, and otherwise the far-back one.
+  pure def generateBlocks(kind: Slot -> int, equiv: Slot -> int): Set[Block] =
+    kind.keys().filter(slot => kind.get(slot) != 6).map(slot => {
+      val parent = primaryParent(kind, slot)
+      val latest = latestPrimaries(kind, slot)
+      val primary = { slot: slot, hash: genHash(slot, 0), parent: parent }
+      val second = { slot: slot, hash: genHash(slot, 1), parent: parent }
+      val e = equiv.get(slot)
+      if (e == 0) Set(primary, second)
+      else if (e == 1) Set(primary, { ...second, parent: if (parent == latest._1) latest._2 else latest._1 })
+      else Set(primary)
+    }).flatten()
+
+  /// agave patch 8: an `init` that draws the trace's blocks with `generateBlocks`. `kind` and
+  /// `equiv` weight their choices through the size of their ranges, since `oneOf` is uniform:
+  /// per slot, a 6 in 10 honest parent, 1 in 10 each for a crashed leader, a phantom, a far-back,
+  /// and a genesis parent, and 1 in 8 each for the two kinds of equivocation. The singleton
+  /// `blocks` pick records the tree in `mbt::nondetPicks`, as `init`'s does.
+  action initGenerated = {
+    nondet kind = setOfMaps(aliveSlots, 0.to(9)).oneOf()
+    nondet equiv = setOfMaps(aliveSlots, 0.to(7)).oneOf()
+    nondet blocks = Set(generateBlocks(kind, equiv)).oneOf()
+    initWith(blocks)
+  }
+
   // agave patch 7: this and the actions below read `s.blocks` (upstream: `allBlocks`).
   action receiveSpecificBlock(v: ProcessID, b: Block): bool = all {
     s.blocks.contains(b),
@@ -530,5 +590,24 @@ module agave_window {
     ),
     aliveSlots = 0.to(4),
     aliveHashes = Set(42, 43, 46, 50, 51, 52),
+  ).*
+}
+
+
+/// agave-specific instance (not upstream; agave patch 8). Every trace draws its own block tree
+/// over two leader windows (slots 0..7) with `initGenerated`, so it must be run with
+/// `--init=initGenerated`. The Byzantine soup covers every hash the generator can use,
+/// `genHash(slot, lane)` for every slot and lane 0, 1, and 9, so it does not depend on the tree.
+module agave_gen {
+  import consensus(
+    correct = Set("v1", "v2", "v3"),
+    good = Set(),
+    byzantine = Set("b1"),
+    power = Map("v1" -> 3, "v2" -> 2, "v3" -> 2, "b1" -> 1),
+    correctBlocks = Set(),
+    byzantineBlocks = Set(),
+    aliveSlots = 0.to(7),
+    // `genHash(slot, lane)`, which is not in scope here
+    aliveHashes = tuples(0.to(7), Set(0, 1, 9)).map(((slot, lane)) => 100 + 10 * slot + lane),
   ).*
 }
