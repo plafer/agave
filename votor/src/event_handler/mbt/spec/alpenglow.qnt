@@ -204,10 +204,13 @@ module alpenglow {
       })
       .filter(b => isCertified(NotarFallbackCertificate(b), msgs))
 
+  // agave patch 18: the candidate slots include those with only skip-fallback votes, which can
+  // make a skip certificate on their own (upstream: only slots with a skip vote).
   pure def slotsSkipCertified(msgs: Set[NetworkMsg]): Set[Slot] =
     msgs
       .fold(Set(), (s, x) => match x.msg {
         | SkipVoteMsg(m) => s.union(Set(m))
+        | SkipFallbackVoteMsg(m) => s.union(Set(m))
         | _ => s
       })
       .filter(s => isCertified(SkipCertificate(s), msgs))

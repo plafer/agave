@@ -45,6 +45,30 @@ impl Message {
     }
 }
 
+/// Mirror of the spec's `Certificate`.
+// Variant names must match the spec's constructors.
+#[allow(clippy::enum_variant_names)]
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[serde(tag = "tag", content = "value")]
+pub(super) enum Certificate {
+    FastFinalizationCertificate(BlockRef),
+    NotarizationCertificate(BlockRef),
+    NotarFallbackCertificate(BlockRef),
+    SkipCertificate(i64),
+    FinalizationCertificate(i64),
+}
+
+/// Mirror of the spec's `PoolView` (agave patch 13): what a pool holding every message knows.
+#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(super) struct PoolView {
+    /// Every certificate whose votes are among the messages.
+    pub(super) certificates: BTreeSet<Certificate>,
+    /// Every `(slot, parent hash)` for which `ParentReady` holds, including the initial
+    /// `(0, -1)`.
+    #[serde(rename = "parentReady")]
+    pub(super) parent_ready: BTreeSet<(i64, i64)>,
+}
+
 /// Mirror of the spec's `NetworkMsg`.
 #[derive(Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) struct NetworkMsg {
@@ -85,6 +109,10 @@ pub(super) struct SpecState {
     /// Every vote broadcast by a benevolent process since `init`.
     #[serde(rename = "msgBuffer")]
     pub(super) msg_buffer: BTreeSet<NetworkMsg>,
+    /// The spec's pool view (agave patch 13), which every instance has. On agave's side, the view
+    /// that every node's pool shares, or `None` in an instance without pools. `None` is not
+    /// compared.
+    pub(super) pool: Option<PoolView>,
 }
 
 impl PartialEq for SpecState {
@@ -92,10 +120,30 @@ impl PartialEq for SpecState {
     /// with `QUINT_VERBOSE` set. quint-connect evaluates `spec_state != driver_state`, so `self`
     /// is the spec's state and `other` is agave's.
     fn eq(&self, other: &Self) -> bool {
-        let equal = self.system == other.system && self.msg_buffer == other.msg_buffer;
+        let pools = match (&self.pool, &other.pool) {
+            (Some(spec), Some(agave)) => Some((spec, agave)),
+            _ => None,
+        };
+        let equal = self.system == other.system
+            && self.msg_buffer == other.msg_buffer
+            && pools.is_none_or(|(spec, agave)| spec == agave);
         if !equal {
             let mut out = String::from("state differs between the spec and agave:\n");
             set_diff(&mut out, "msgBuffer", &self.msg_buffer, &other.msg_buffer);
+            if let Some((spec, agave)) = pools {
+                set_diff(
+                    &mut out,
+                    "pool.certificates",
+                    &spec.certificates,
+                    &agave.certificates,
+                );
+                set_diff(
+                    &mut out,
+                    "pool.parentReady",
+                    &spec.parent_ready,
+                    &agave.parent_ready,
+                );
+            }
             system_diff(&mut out, &self.system, &other.system);
             eprint!("{out}");
         }

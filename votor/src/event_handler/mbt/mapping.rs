@@ -7,12 +7,12 @@
 //!   agave reports for children of the genesis bank. Every other spec hash `h` maps to a fixed,
 //!   distinct `Hash`.
 //! - Spec blocks are turned into frozen banks that are never inserted into `BankForks`.
-//! - Votes and agave's pending blocks map back onto spec values through the inverses of the slot
-//!   and hash mappings.
+//! - Votes, certificates, and agave's pending blocks map back onto spec values through the
+//!   inverses of the slot and hash mappings.
 
 use {
-    super::spec_types::{BlockRef, Message},
-    agave_votor_messages::{consensus_message::Block, vote::Vote},
+    super::spec_types::{BlockRef, Certificate, Message},
+    agave_votor_messages::{certificate::CertificateType, consensus_message::Block, vote::Vote},
     anyhow::{Context, Result, anyhow, bail, ensure},
     serde::Deserialize,
     solana_clock::Slot,
@@ -90,6 +90,27 @@ pub(super) fn to_spec_message(vote: &Vote) -> Result<Message> {
         Vote::SkipFallback(vote) => Message::SkipFallbackVoteMsg(spec_slot(vote.slot)?),
         Vote::Finalize(vote) => Message::FinalVoteMsg(spec_slot(vote.slot)?),
         Vote::Genesis(_) => bail!("genesis votes have no spec counterpart: {vote:?}"),
+    })
+}
+
+/// Maps the type of a certificate an agave pool holds onto the spec certificate with the same
+/// votes.
+pub(super) fn to_spec_certificate(certificate: &CertificateType) -> Result<Certificate> {
+    Ok(match certificate {
+        CertificateType::FinalizeFast(block) => {
+            Certificate::FastFinalizationCertificate(spec_block_ref(block)?)
+        }
+        CertificateType::Notarize(block) => {
+            Certificate::NotarizationCertificate(spec_block_ref(block)?)
+        }
+        CertificateType::NotarizeFallback(block) => {
+            Certificate::NotarFallbackCertificate(spec_block_ref(block)?)
+        }
+        CertificateType::Skip(slot) => Certificate::SkipCertificate(spec_slot(*slot)?),
+        CertificateType::Finalize(slot) => Certificate::FinalizationCertificate(spec_slot(*slot)?),
+        CertificateType::Genesis(_) => {
+            bail!("genesis certificates have no spec counterpart: {certificate:?}")
+        }
     })
 }
 

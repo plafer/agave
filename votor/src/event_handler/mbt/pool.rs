@@ -17,7 +17,10 @@
 //! equal the spec's unions.
 
 use {
-    super::mapping::OFFSET,
+    super::{
+        mapping::{GENESIS_HASH, OFFSET, spec_hash, spec_slot, to_spec_certificate},
+        spec_types::{Certificate, PoolView},
+    },
     crate::{
         consensus_pool::ConsensusPool,
         consensus_pool_service::{PoolMessage, PoolVote},
@@ -173,5 +176,55 @@ impl NodePool {
     /// The types of the certificates the pool holds.
     pub(super) fn certificate_types(&self) -> impl Iterator<Item = &CertificateType> {
         self.pool.completed_certificate_types()
+    }
+
+    /// Projects the pool onto the spec's `PoolView` for spec slots `0..num_slots`: the
+    /// certificates it holds, and the parent-ready pairs it emitted together with the initial
+    /// one. Certificates and pairs past the last spec slot are left out, since the spec has no
+    /// state there.
+    ///
+    /// The spec's certificates are conditions on the votes, and a notarization certificate's
+    /// votes also make a notar-fallback certificate. Agave builds at most one of the
+    /// certificates a block's notarize votes make, the strongest, and treats `Notarize` and
+    /// `FinalizeFast` as notar-fallback-or-stronger (as `ParentReadyTracker` does). So each of
+    /// them also projects onto the block's `NotarFallbackCertificate`. `FinalizeFast` does not
+    /// project onto `NotarizationCertificate`: agave does not treat it as one, and emits no
+    /// `BlockNotarized` for it.
+    pub(super) fn view(&self, num_slots: usize) -> Result<PoolView> {
+        let in_spec = |slot: Slot| {
+            spec_slot(slot)
+                .ok()
+                .and_then(|s| usize::try_from(s).ok())
+                .is_some_and(|s| s < num_slots)
+        };
+        let mut certificates = BTreeSet::new();
+        for certificate in self.certificate_types() {
+            if !in_spec(certificate.slot()) {
+                continue;
+            }
+            let spec_certificate = to_spec_certificate(certificate)?;
+            certificates.insert(spec_certificate);
+            match spec_certificate {
+                Certificate::NotarizationCertificate(block)
+                | Certificate::FastFinalizationCertificate(block) => {
+                    certificates.insert(Certificate::NotarFallbackCertificate(block));
+                }
+                Certificate::NotarFallbackCertificate(_)
+                | Certificate::SkipCertificate(_)
+                | Certificate::FinalizationCertificate(_) => {}
+            }
+        }
+        let mut parent_ready = BTreeSet::from([(spec_slot(OFFSET)?, GENESIS_HASH)]);
+        for event in &self.emitted {
+            if let PoolEvent::ParentReady { slot, parent } = event
+                && in_spec(*slot)
+            {
+                parent_ready.insert((spec_slot(*slot)?, spec_hash(&parent.block_id)?));
+            }
+        }
+        Ok(PoolView {
+            certificates,
+            parent_ready,
+        })
     }
 }

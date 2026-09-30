@@ -3,6 +3,14 @@ module consensus {
   import alpenglow.* from "./alpenglow"
   export alpenglow.*
 
+  /// agave patch 13: what a pool that holds every message knows: the certificates that
+  /// `isCertified` holds for, and the pairs `(s, hash(b))` for which `ParentReady(s, hash(b))`
+  /// is enabled.
+  type PoolView = {
+    certificates: Set[Certificate],
+    parentReady: Set[(Slot, Blockhash)],
+  }
+
   /// This is all the information of the global state
   type Environment = {
     // agave patch 7: the blocks of this trace, fixed by `init` (upstream: the constant
@@ -17,6 +25,11 @@ module consensus {
 
     // Started timeouts per process
     activeTimeouts: ProcessID -> Set[TimeoutEventData],
+
+    // agave patch 13: an observation of the pool over all messages, recomputed after every
+    // step (see `withPoolView`). No action reads it; the model-based tests compare it with
+    // agave's consensus pools.
+    pool: PoolView,
   }
 
   /// Interface consensus algorithm / state machine: how consensus algorithm effects the environment
@@ -78,10 +91,44 @@ module consensus {
   /// for every alive slot, since `trySkipWindow` touches the whole window (upstream: a fixed 5).
   pure val numSlots = 4 * (aliveSlots.fold(0, (m, x) => max(m, x)) / 4 + 1)
 
+  /// agave patch 13: the pool view over the messages `msgs` and the trace's `blocks`.
+  /// `parentReady` always has `(0, -1)`, the parent ready that `init` preloads.
+  pure def poolView(msgs: Set[NetworkMsg], blocks: Set[Block]): PoolView = {
+    // The votes of a certificate are all in its slot, so each candidate is only checked against
+    // the messages of its slot. That gives the same result, and makes `quint run` faster.
+    val msgsBySlot = aliveSlots.union(blocks.map(b => b.slot))
+      .mapBy(slot => msgs.filter(m => slotOf(m.msg) == slot))
+    val blockCertificates = blocks.map(b => b.reference()).map(r => Set(
+      FastFinalizationCertificate(r),
+      NotarizationCertificate(r),
+      NotarFallbackCertificate(r),
+    ).filter(c => isCertified(c, msgsBySlot.get(r.slot)))).flatten()
+    val slotCertificates = aliveSlots.map(slot => Set(
+      SkipCertificate(slot),
+      FinalizationCertificate(slot),
+    ).filter(c => isCertified(c, msgsBySlot.get(slot)))).flatten()
+    {
+      certificates: blockCertificates.union(slotCertificates),
+      parentReady: Set((0, -1)).union(aliveSlots.map(slot =>
+        parentReadyBlocks(slot, msgs, blocks).map(b => (slot, b.hash))
+      ).flatten()),
+    }
+  }
+
+  /// agave patch 13: `env` with its pool view brought up to date. Only in instances without
+  /// Byzantine processes, the ones where the model-based tests run agave's consensus pools
+  /// (patch 12); elsewhere the view stays empty. Computing it over the Byzantine soup of
+  /// `agave_gen` more than doubled the time `quint run` takes there.
+  pure def withPoolView(env: Environment): Environment =
+    if (byzantine == Set()) { ...env, pool: poolView(env.msgBuffer.union(byzSoup), env.blocks) }
+    else env
+
   /// agave patch 7: initializes the environment with the trace's `blocks`.
+  /// agave patch 13: and with the pool view of no messages.
   action initWith(blocks: Set[Block]): bool = all {
-    s' = {
+    s' = withPoolView({
       blocks: blocks,
+      pool: { certificates: Set(), parentReady: Set() },
       system: benevolent.mapBy(_ => {
         // preload state for `numSlots` slots (agave patch 3)
         state: range(0, numSlots).listMap(i => if (i == 0) Set(ParentReady(-1)) else Set()),
@@ -92,7 +139,7 @@ module consensus {
       // agave patch 4: `ParentReady(-1)` at slot 0 starts the timeouts of its whole window,
       // as `ParentReadyInput` does via `setTimeouts` (upstream: `Set(0)`).
       activeTimeouts: benevolent.mapBy(v => windowSlots(0)),
-    },
+    }),
     ch' = aliveSlots.mapBy(s => Set()),
     counter' = 0,
   }
@@ -186,7 +233,8 @@ module consensus {
   action fireTimeoutEvent(v: ProcessID, now: Slot): bool = all {
     s.activeTimeouts.get(v).contains(now),
     val s2 = { ...s, activeTimeouts: s.activeTimeouts.set(v, s.activeTimeouts.get(v).exclude(Set(now))) }
-    s' = applyEffect(s2, v, consensus(s2.system.get(v), TimeOutInput(now))),
+    // agave patch 13: also updates the pool view.
+    s' = withPoolView(applyEffect(s2, v, consensus(s2.system.get(v), TimeOutInput(now)))),
     ch' = finalizedBlocks,
     counter' = counter + 1,
   }
@@ -196,7 +244,8 @@ module consensus {
   //
 
   action processInput(id: ProcessID, input: ConsensusInput): bool = all {
-    s' = applyEffect(s, id, consensus(s.system.get(id), input)),
+    // agave patch 13: also updates the pool view.
+    s' = withPoolView(applyEffect(s, id, consensus(s.system.get(id), input))),
     ch' = finalizedBlocks,
     counter' = counter + 1,
   }
@@ -226,9 +275,10 @@ module consensus {
   // holds a notarization or notar-fallback certificate for a previous block b,
   // and skip certificates for every slot s′ since b, i.e., for slot(b) < s′ < s.
   // agave patch 7: takes the environment's `blocks` (upstream: `allBlocks`).
+  // agave patch 14: also returns `genesisBlock` if every slot before `slot` is skip-certified.
   pure def parentReadyBlocks(slot: Slot, msgs: Set[NetworkMsg], blocks: Set[Block]): Set[Block] = {
     if (not(firstSlotInLeaderWindow(slot))) Set() else
-    blocks.filter(b =>
+    val certified = blocks.filter(b =>
       and {
         b.slot < slot,
         or {
@@ -241,7 +291,19 @@ module consensus {
         (b.slot + 1).to(slot - 1).subseteq(slotsSkipCertified(msgs))
       }
     )
+    // agave patch 14: the genesis parent (hash -1) is certified by definition, as `init`'s
+    // `ParentReady(-1)` at slot 0 assumes, so a later window start is ready for it once every
+    // earlier slot is skip-certified (upstream: never, since genesis is not one of the blocks).
+    // Slot 0 itself is left out, because `init` already made it ready for genesis.
+    if (slot > 0 and 0.to(slot - 1).subseteq(slotsSkipCertified(msgs)))
+      certified.union(Set(genesisBlock))
+    else
+      certified
   }
+
+  /// agave patch 14: the genesis block, the parent of every block whose parent hash is -1. It is
+  /// never one of the environment's blocks.
+  pure val genesisBlock: Block = { slot: -1, hash: -1, parent: -1 }
 
   /// Emit ParentReady and process it
   action parentReadyAction(v: ProcessID, now: Slot): bool =

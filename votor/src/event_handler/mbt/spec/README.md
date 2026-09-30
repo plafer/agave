@@ -16,9 +16,9 @@ does not typecheck at the upstream commit.
 
 Every change to the vendored files is listed here, with the reason for it.
 Each changed spot is marked with an `agave patch N` comment. Patches 1, 2,
-4, 5, 6, 11, and 17 are to be reported upstream. Numbers 13 to 16 are
-reserved for later patches that compare agave's consensus pool with the spec;
-patch 17 was needed first.
+4, 5, 6, 11, 14, 17, and 18 are to be reported upstream. Numbers 15 and 16
+are reserved for later patches that compare agave's consensus pool with the
+spec; patches 17 and 18 were needed first.
 
 ### Patch 1: pending blocks are a per-slot list, tried in arrival order
 
@@ -265,6 +265,56 @@ block, while the spec's `blockNotarizedAction` is enabled. With 3, 2, 2, 2,
 60% is 6 of 9 and 80% is 8 of 9, and no single vote gets from 5 or less to 8
 or more.
 
+### Patch 13: the environment has a pool view
+
+`statemachine.qnt` (`PoolView`, `Environment`, `poolView`, `withPoolView`,
+`initWith`, `fireTimeoutEvent`, `processInput`).
+
+Not a fix, and not to be reported upstream. The model-based tests compare
+agave's consensus pools with the spec, but ITF traces only record state
+variables, and the spec's certificates are conditions over the message soup.
+The patch adds a `pool` field to `Environment` that `initWith`,
+`fireTimeoutEvent`, and `processInput` recompute after the step's effect.
+`poolView` holds every notarization, notar-fallback, and fast-finalization
+certificate on one of the trace's blocks, and every skip and finalization
+certificate on an alive slot, for which `isCertified` holds over
+`msgBuffer` and the Byzantine soup, and every pair `(s, hash(b))` with `b` in
+`parentReadyBlocks(s, ...)`, plus the `(0, -1)` that `init` preloads. Each
+candidate certificate is checked against the messages of its own slot only,
+which gives the same result faster.
+
+No action reads the field, so no trace changes apart from it: with and without
+the patch, `quint run --mbt` produces the same actions, picks, and states
+(ignoring `pool`) for 50 traces of each of the five instances, at seeds
+`0x1234` and `0x4321`. The view is only computed in instances without
+Byzantine processes, the ones where the model-based tests run agave's pools
+(patch 12). Elsewhere it stays empty, because evaluating it over the Byzantine
+soup made `quint run` on `agave_gen` take about 28 s instead of 11 s for 180
+traces.
+
+### Patch 14: genesis is a parent-ready candidate
+
+`statemachine.qnt` (`parentReadyBlocks`, `genesisBlock`).
+
+`init` preloads `ParentReady(-1)` at slot 0, so the genesis parent (hash -1)
+is treated as certified. But `parentReadyBlocks` only returns blocks of the
+environment, and genesis is never one of them, so upstream a later window
+start can never become ready for genesis, even if every earlier slot is
+skip-certified. A fully skipped first window then leaves no parent at all.
+Agave's `ParentReadyTracker` starts from the same initial parent ready by
+marking the slots before it skip-certified, so its pools emit
+`ParentReady(4, genesis)` (in spec slots) once spec slots 0 to 3 have skip
+certificates. With the pool view (patch 13), every run of `agave_pool`
+failed on this, for example with `pool.parentReady: only in agave: (4, -1)`
+(`QUINT_SEED=0xbfa8f22b`). The patch has `parentReadyBlocks(slot, ...)` also
+return `genesisBlock = { slot: -1, hash: -1, parent: -1 }` when `slot > 0`
+and every slot in `0..slot - 1` is skip-certified. Slot 0 is left out because
+`init` already made it ready for genesis, and firing it again would restart
+its timeouts. This changes traces of `agave_window`, `agave_gen`, and
+`agave_pool`: at seed `0x1234`, `parentReadyAction` for genesis occurs in 16,
+8, and 11 of 50 traces. The upstream instances have no second window, so
+their traces do not change. The gap is latent upstream for the same reason.
+
 ### Patch 17: `safeToSkipCondition` requires that the process did not vote to skip
 
 `statemachine.qnt` (`safeToSkipCondition`).
@@ -282,6 +332,27 @@ disjoint, so with the pool under test (patch 12) the spec had skip
 certificates that agave's pools could not form. The patch requires that the
 process sent some message for `s` and no `SkipVoteMsg(s)`. It changes the
 condition for every instance.
+
+### Patch 18: skip-fallback votes alone can skip-certify a slot for `ParentReady`
+
+`alpenglow.qnt` (`slotsSkipCertified`).
+
+`slotsSkipCertified(msgs)` only considers the slots that have a
+`SkipVoteMsg`, and then keeps those for which `isCertified(SkipCertificate(s),
+msgs)` holds. A skip certificate counts skip and skip-fallback votes
+(Table 5, and `isCertified`), so a slot whose skip certificate is made of
+skip-fallback votes alone was left out. That happens when the processes voted
+to notarize different blocks of the slot and then received `SafeToSkip`. Such
+a slot then blocked `parentReadyBlocks` for the next window, while agave's
+pools, which build the skip certificate from either kind of vote, emitted the
+`ParentReady`. After patch 14, two of three runs of `agave_pool` failed this
+way, for example with `pool.parentReady: only in agave: (4, -1)`
+(`QUINT_SEED=0xd47703c2`); `quint run --invariant` on a check that every
+certified slot is in `slotsSkipCertified` found a trace where three
+skip-fallback votes certify slot 0. The patch also collects the slots of
+`SkipFallbackVoteMsg`. `parentReadyBlocks` is the only reader, so this
+changes `parentReadyAction`, in every instance with a second window. The bug
+is upstream too, and is to be reported upstream.
 
 ### Addition: the `agave_window` instance
 
