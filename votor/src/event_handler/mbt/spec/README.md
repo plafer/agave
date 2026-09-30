@@ -16,7 +16,9 @@ does not typecheck at the upstream commit.
 
 Every change to the vendored files is listed here, with the reason for it.
 Each changed spot is marked with an `agave patch N` comment. Patches 1, 2,
-4, 5, 6, and 11 are to be reported upstream.
+4, 5, 6, 11, and 17 are to be reported upstream. Numbers 13 to 16 are
+reserved for later patches that compare agave's consensus pool with the spec;
+patch 17 was needed first.
 
 ### Patch 1: pending blocks are a per-slot list, tried in arrival order
 
@@ -240,6 +242,46 @@ invariant, and neither `consensus` nor the model-based tests read
 `isDescendant`, so the patch changes no trace. The bug is upstream too,
 wherever a block and a descendant two or more blocks down are both finalized,
 and is to be reported upstream.
+
+### Patch 12: the `agave_pool` instance
+
+`statemachine.qnt` (module `agave_pool`).
+
+Not a fix, and not to be reported upstream. `agave_pool` is `agave_gen`
+without Byzantine processes: its b1 becomes the correct v4, with four correct
+processes of stakes 3, 2, 2, and 2, and slots 0..7. It must be run with
+`--init=initGenerated`. The model-based tests run agave's consensus pool for
+every process in this instance. With a Byzantine process, the Byzantine soup
+would let it send conflicting votes, which the spec counts once per sender and
+agave's pool once per vote (in production, bls-sigverify drops such votes
+before they reach the pool). Byzantine leaders are still covered by the
+generated block trees.
+
+v4 has stake 2 rather than `agave_gen`'s 1 for b1. With 3, 2, 2, 1, v2 and v3
+notarizing a block (4 of 8, 50%) and then v1 (7 of 8) takes the notarize
+votes from below 60% to 80% in one vote. Agave's pool then only forms the
+fast-finalization certificate, and never emits `BlockNotarized` for the
+block, while the spec's `blockNotarizedAction` is enabled. With 3, 2, 2, 2,
+60% is 6 of 9 and 80% is 8 of 9, and no single vote gets from 5 or less to 8
+or more.
+
+### Patch 17: `safeToSkipCondition` requires that the process did not vote to skip
+
+`statemachine.qnt` (`safeToSkipCondition`).
+
+The paper (Definition 16) issues `SafeToSkip(s)` only "if the node voted in
+slot s already, but not to skip s", and the comment in the spec says the
+same. Upstream only requires some message from the process in slot `s` other
+than `SkipVoteMsg(s)`, so the condition also holds for a process that voted
+to skip `s` and then cast a notar-fallback vote in it. That process then casts
+a skip-fallback vote next to its skip vote. Agave never does: its pool emits
+`SafeToSkip` only if the node's first vote in the slot was a notarize vote.
+Agave's pool also cannot build a skip certificate that counts both votes of
+one node, since the skip and skip-fallback signers of a certificate must be
+disjoint, so with the pool under test (patch 12) the spec had skip
+certificates that agave's pools could not form. The patch requires that the
+process sent some message for `s` and no `SkipVoteMsg(s)`. It changes the
+condition for every instance.
 
 ### Addition: the `agave_window` instance
 

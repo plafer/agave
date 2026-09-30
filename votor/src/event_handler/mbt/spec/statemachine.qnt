@@ -309,11 +309,11 @@ module consensus {
   // but not to skip s.
   def safeToSkipCondition(v: ProcessID, now: Slot): bool = all {
     // node voted in slot s already, but not to skip s.
-    allMessages.exists(m =>
-      m.sender == v
-      and slotOf(m.msg) == now
-      and m.msg != SkipVoteMsg(now)
-    ),
+    // agave patch 17: `v` sent some message for `now`, and no `SkipVoteMsg(now)` (upstream: some
+    // message for `now` other than `SkipVoteMsg(now)`, which also holds after `v` voted to skip
+    // `now` and then cast a notar-fallback vote in it).
+    allMessages.exists(m => m.sender == v and slotOf(m.msg) == now),
+    not(allMessages.exists(m => m.sender == v and m.msg == SkipVoteMsg(now))),
 
     // Moreover:
     // skip(s) + Σ_b notar(b) − max_b notar(b) ≥ 40%.
@@ -695,6 +695,33 @@ module agave_gen {
     byzantineBlocks = Set(),
     aliveSlots = 0.to(7),
     // `genHash(slot, lane)`, which is not in scope here
+    aliveHashes = tuples(0.to(7), Set(0, 1, 9)).map(((slot, lane)) => 100 + 10 * slot + lane),
+  ).*
+}
+
+
+/// agave-specific instance (not upstream; agave patch 12). `agave_gen` without Byzantine
+/// voters, for the model-based tests that run agave's consensus pool next to each event handler:
+/// the Byzantine soup lets a Byzantine process send conflicting votes, which the spec counts once
+/// per sender and agave's pool once per vote. `agave_gen`'s b1 becomes the correct v4. Byzantine
+/// leaders are still covered by the generated block trees. Must be run with
+/// `--init=initGenerated`.
+module agave_pool {
+  import consensus(
+    correct = Set("v1", "v2", "v3", "v4"),
+    good = Set(),
+    byzantine = Set(),
+    // Not `agave_gen`'s 3, 2, 2, 1: there, v2 and v3 notarizing a block (4 of 8, 50%) and then
+    // v1 (7 of 8) takes the notarize votes from below 60% to 80% at once. Agave's pool then
+    // forms only the fast-finalization certificate and emits `Finalized(b, true)` but never
+    // `BlockNotarized(b)`, while the spec's `blockNotarizedAction` is enabled. With 3, 2, 2, 2
+    // (60% is 6 of 9 and 80% is 8 of 9), no single vote gets from 5 or less to 8 or more.
+    power = Map("v1" -> 3, "v2" -> 2, "v3" -> 2, "v4" -> 2),
+    correctBlocks = Set(),
+    byzantineBlocks = Set(),
+    aliveSlots = 0.to(7),
+    // `genHash(slot, lane)`, which is not in scope here. With no Byzantine process, this only
+    // sizes the (empty) Byzantine soup.
     aliveHashes = tuples(0.to(7), Set(0, 1, 9)).map(((slot, lane)) => 100 + 10 * slot + lane),
   ).*
 }

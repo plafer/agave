@@ -464,6 +464,12 @@ impl ConsensusPool {
             .contains_key(&CertificateType::Skip(slot))
     }
 
+    /// The types of every certificate the pool holds, in `CertificateType` order.
+    #[cfg(test)]
+    pub(crate) fn completed_certificate_types(&self) -> impl Iterator<Item = &CertificateType> {
+        self.completed_certificates.keys()
+    }
+
     /// Checks if a specific block has a NotarizeFallback certificate (or stronger).
     /// This is used for verifying that an intrawindow block's parent has been certified.
     pub(crate) fn block_has_notar_fallback_or_stronger(&self, block: Block) -> bool {

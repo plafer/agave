@@ -1,4 +1,5 @@
-//! Model-based tests of the event handler against the Alpenglow Quint specification.
+//! Model-based tests of the event handler, and of the consensus pool, against the Alpenglow Quint
+//! specification.
 //!
 //! [quint-connect] runs `quint run --mbt` on the vendored spec in `spec/` and replays every
 //! generated trace step against agave. Each benevolent spec process gets its own
@@ -8,6 +9,11 @@
 //! builds a bank for each block from that pick. In the `agave_gen` instance that set is a block
 //! tree drawn anew for every trace (spec patch 8). See `mapping.rs` for how spec slots, hashes,
 //! and blocks map onto agave values.
+//!
+//! In the `agave_pool` instance, every node also runs its own `ConsensusPool` (see `pool.rs`),
+//! which receives every vote any node pushes. There, a spec action that delivers
+//! `BlockNotarized` or `ParentReady` passes on the event the node's pool emitted, instead of
+//! building it from the action's picks.
 //!
 //! # Running
 //!
@@ -22,14 +28,21 @@
 //!
 //! # What is checked
 //!
-//! Only the event handler is under test. Replaying a trace checks that:
+//! The event handler is under test in every instance, and the consensus pool in `agave_pool`.
+//! Replaying a trace checks that:
 //!
 //! - `handle_event` neither fails nor panics (for example on a `VoteHistory` equivocation
 //!   assert), and only emits `BLSOp::PushVote`;
 //! - a timer is set for the slot of every `ParentReady`;
 //! - no node pushes a vote it already pushed since `init`. The spec's `msgBuffer` is a set, so a
 //!   repeated vote would otherwise go unnoticed; with spec patches 5 and 6 a correct spec process
-//!   never broadcasts the same message twice either.
+//!   never broadcasts the same message twice either;
+//! - in `agave_pool`, every `blockNotarizedAction` and `parentReadyAction` finds the matching
+//!   `BlockNotarized` or `ParentReady` among the events the node's pool emitted, so the pool is at
+//!   least as live as the spec for these two events. The event is passed to the event handler the
+//!   first time the spec delivers it, and not again, as in agave; with spec patches 5 and 6 a
+//!   repeated input leaves the spec's compared state unchanged. The votes a node sends its own
+//!   pool must also be the votes it pushes.
 //!
 //! After every step, the driver's projection of agave's state must equal the spec's environment
 //! variable `s`, restricted to:
@@ -41,11 +54,15 @@
 //!
 //! # Trusted, not checked
 //!
-//! - The consensus pool. Certificates, parent-ready, safe-to-notar, and safe-to-skip are decided
-//!   by the spec's environment over its message soup (which includes every possible Byzantine
-//!   vote) and injected as events. Agave's pool-side behavior, such as deferring intra-window
-//!   `SafeToNotar` until the parent is verified and emitting each derived event once, is not
-//!   exercised.
+//! - The consensus pool, outside `agave_pool`. Certificates, parent-ready, safe-to-notar, and
+//!   safe-to-skip are decided by the spec's environment over its message soup (which includes
+//!   every possible Byzantine vote) and injected as events.
+//! - In `agave_pool`: `SafeToNotar` and `SafeToSkip`, which still come from the spec's picks (the
+//!   pools emit them too, and they are counted but not used), so agave's deferral of
+//!   intra-window `SafeToNotar` until the parent is verified is not exercised; events and
+//!   certificates a pool has but the spec never delivers or holds; `BlockNotarFallback` and
+//!   `Finalized`, which the pools emit but are never dispatched; and Byzantine voters, which
+//!   `agave_pool` does not have (see `pool.rs`).
 //! - The timer manager. The spec's `activeTimeouts` is a set of slots that may fire in any order,
 //!   while agave arms one two-phase timer per window that fires in slot order by wall-clock
 //!   time. `activeTimeouts` is not compared. Instead `fireTimeoutEvent` injects `Timeout`
@@ -63,11 +80,34 @@
 //! - Agave's `slot == 1` special case for the first leader window, which the slot offset keeps
 //!   out of reach (see `mapping.rs`).
 //!
+//! # Glue between the pools
+//!
+//! In `agave_pool`, the driver stands in for the parts of agave around the pools:
+//!
+//! - Vote delivery. Every vote a node pushes reaches every pool before the next step, one vote at
+//!   a time in the order it was cast: the node's own pool gets the `VoteMessage` from the node's
+//!   own-vote channel, as `PoolVote::Own`, and every other pool gets it as a
+//!   `PoolVote::External` `VoteAggregate`, without bls-sigverify's signature checks, conflict
+//!   filter, or batching.
+//! - The initial `ParentReady`. Every pool starts with spec slot 0 (agave slot `OFFSET`)
+//!   parent-ready for genesis, as its event handler does, and the driver sends that
+//!   `ParentReady` to the event handler itself, as the consensus pool service does.
+//! - A fresh pool per node and trace, rooted at the genesis bank, which stays the root, so the
+//!   pools never prune.
+//!
+//! One divergence is avoided by the choice of stakes rather than resolved. When a single vote
+//! takes a block's notarize votes from below 60% to 80% or more, agave's pool forms only the
+//! fast-finalization certificate, and emits `Finalized(block, true)` but no `BlockNotarized`,
+//! while the spec's `blockNotarizedAction` is enabled. With `agave_gen`'s stakes (3, 2, 2, 1) this
+//! happens when v2 and v3 notarize a block before v1, so `agave_pool` uses 3, 2, 2, 2, where no
+//! single vote can do it. In production, bls-sigverify batches votes into aggregates, so such a
+//! jump is common there.
+//!
 //! # Spec patches
 //!
 //! The vendored spec is patched where agave's behavior is the intended one, and extended with the
-//! agave-specific `agave_window` and `agave_gen` instances. `spec/README.md` describes every
-//! patch:
+//! agave-specific `agave_window`, `agave_gen`, and `agave_pool` instances. `spec/README.md`
+//! describes every patch:
 //!
 //! 1. Pending blocks are a per-slot list, tried in arrival order, as in agave.
 //! 2. `parentReadyAction` requires skip certificates only for the slots strictly between the
@@ -85,10 +125,14 @@
 //!     generated block has, to make `agave_gen` steps faster.
 //! 11. `isDescendant` walks slots in ascending order, which `quint run`'s Rust backend does not
 //!     guarantee for a fold over a set. Only the `safety` invariant reads it.
+//! 12. The `agave_pool` instance: `agave_gen` without Byzantine processes.
+//! 17. `safeToSkipCondition` requires that the process sent no skip vote in the slot, as the
+//!     paper and agave do. Numbers 13 to 16 are reserved for later pool patches.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
 mod mapping;
+mod pool;
 mod spec_types;
 
 use {
@@ -97,6 +141,7 @@ use {
             Banks, GENESIS_HASH, OFFSET, SpecBlock, agave_slot, block_ref, hash_of, spec_hash,
             spec_slot, to_spec_block, to_spec_message,
         },
+        pool::{NodePool, PoolEvent},
         spec_types::{LocalState, Message, NetworkMsg, SlotObject, SpecState},
     },
     super::{
@@ -104,13 +149,19 @@ use {
         test_context::{EventHandlerTestContext, SharedFixtures, setup_node},
     },
     crate::{
+        consensus_pool_service::PoolVote,
         event::{CompletedBlock, VotorEvent},
+        tests::new_vote_aggregate,
         vote_history_storage::NullVoteHistoryStorage,
         voting_service::BLSOp,
     },
-    agave_votor_messages::consensus_message::Block,
+    agave_votor_messages::{
+        certificate::CertificateType,
+        consensus_message::{Block, VoteMessage},
+    },
     anyhow::{anyhow, bail, ensure},
     quint_connect::{Config, Driver, Path, Result, State, Step, quint_run, switch},
+    solana_runtime::bank::Bank,
     std::{
         any::Any,
         collections::{BTreeMap, BTreeSet},
@@ -133,6 +184,10 @@ trait Instance {
     /// The instance's `numSlots` (agave patch 3): the length of every per-slot list in a
     /// process's `LocalState`.
     const NUM_SLOTS: usize;
+    /// Whether every node runs a consensus pool, from which `BlockNotarized` and `ParentReady`
+    /// are taken instead of from the spec's picks. Only for instances without Byzantine
+    /// processes (see `pool.rs`).
+    const WITH_POOL: bool;
 }
 
 /// The `some_byz` instance: five equal-stake correct processes and one Byzantine process.
@@ -149,6 +204,7 @@ impl Instance for SomeByz {
         ("b1", 1, false),
     ];
     const NUM_SLOTS: usize = 4;
+    const WITH_POOL: bool = false;
 }
 
 /// The `some_byz_vp` instance: two correct processes and one Byzantine process, with different
@@ -160,6 +216,7 @@ impl Instance for SomeByzVp {
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
     const NUM_SLOTS: usize = 4;
+    const WITH_POOL: bool = false;
 }
 
 /// The agave-specific `agave_window` instance, whose slot 4 starts a second leader window, so
@@ -171,6 +228,7 @@ impl Instance for AgaveWindow {
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
     const NUM_SLOTS: usize = 8;
+    const WITH_POOL: bool = false;
 }
 
 /// The agave-specific `agave_gen` instance, run with `initGenerated`: every trace draws its own
@@ -186,6 +244,24 @@ impl Instance for AgaveGen {
         ("b1", 1, false),
     ];
     const NUM_SLOTS: usize = 8;
+    const WITH_POOL: bool = false;
+}
+
+/// The agave-specific `agave_pool` instance, run with `initGenerated`: `agave_gen` with its
+/// Byzantine process turned into the correct `v4`, of stake 2 (spec patch 12). Every node runs a
+/// consensus pool.
+struct AgavePool;
+
+impl Instance for AgavePool {
+    const STATE_PATH: Path = &["agave_pool::consensus::s"];
+    const PROCESSES: &'static [(&'static str, u64, bool)] = &[
+        ("v1", 3, true),
+        ("v2", 2, true),
+        ("v3", 2, true),
+        ("v4", 2, true),
+    ];
+    const NUM_SLOTS: usize = 8;
+    const WITH_POOL: bool = true;
 }
 
 /// Replays spec traces against one event handler per benevolent spec process.
@@ -197,6 +273,11 @@ struct VotorMbtDriver<I: Instance> {
     nodes: BTreeMap<String, Node>,
     /// Every vote pushed by a node since `init`: agave's counterpart of the spec's `msgBuffer`.
     msg_buffer: BTreeSet<NetworkMsg>,
+    /// The genesis bank, which stays the root bank of every pool.
+    genesis: Arc<Bank>,
+    /// If `I::WITH_POOL`, the consensus pool of every node, keyed like `nodes` and rebuilt by
+    /// every `init`. Empty otherwise.
+    pools: BTreeMap<String, NodePool>,
     stats: ReplayStats,
     _instance: PhantomData<I>,
 }
@@ -213,6 +294,12 @@ struct ReplayStats {
     traces_with: BTreeMap<String, usize>,
     /// The actions taken and the kinds of vote pushed so far in the current trace.
     current_trace: BTreeSet<String>,
+    /// Number of derived events of each kind that the pools emitted, summed over the pools.
+    pool_emitted: BTreeMap<&'static str, usize>,
+    /// Number of pool events of each kind that a spec action passed to an event handler.
+    pool_dispatched: BTreeMap<&'static str, usize>,
+    /// Number of spec actions that asked for a pool event that was already dispatched.
+    pool_repeated: BTreeMap<&'static str, usize>,
 }
 
 impl ReplayStats {
@@ -244,6 +331,45 @@ impl ReplayStats {
         self.votes = self.votes.saturating_add(1);
         self.current_trace.insert(msg.kind().to_string());
     }
+
+    fn record_pool_emitted(&mut self, event: &PoolEvent) {
+        increment(&mut self.pool_emitted, event.kind());
+    }
+
+    /// Records a spec action that asked for the pool event `event`, which was passed to the event
+    /// handler if `dispatched`, and had been passed before otherwise.
+    fn record_pool_dispatch(&mut self, event: &PoolEvent, dispatched: bool) {
+        if dispatched {
+            increment(&mut self.pool_dispatched, event.kind());
+            self.current_trace
+                .insert(format!("dispatched {}", event.kind()));
+        } else {
+            increment(&mut self.pool_repeated, event.kind());
+        }
+    }
+
+    /// Records the kinds of certificate that some pool holds at the end of the current trace.
+    fn record_pool_certificates<'a>(
+        &mut self,
+        certificates: impl IntoIterator<Item = &'a CertificateType>,
+    ) {
+        for certificate in certificates {
+            let kind = match certificate {
+                CertificateType::Finalize(_) => "Finalize",
+                CertificateType::FinalizeFast(_) => "FinalizeFast",
+                CertificateType::Notarize(_) => "Notarize",
+                CertificateType::NotarizeFallback(_) => "NotarizeFallback",
+                CertificateType::Skip(_) => "Skip",
+                CertificateType::Genesis(_) => "Genesis",
+            };
+            self.current_trace.insert(format!("certificate {kind}"));
+        }
+    }
+}
+
+fn increment(counts: &mut BTreeMap<&'static str, usize>, key: &'static str) {
+    let count = counts.entry(key).or_default();
+    *count = count.saturating_add(1);
 }
 
 /// `count` of `total` as a whole percentage.
@@ -327,9 +453,11 @@ impl<I: Instance> VotorMbtDriver<I> {
         let genesis = fixtures.bank_forks.read().unwrap().root_bank();
         Self {
             _fixtures: fixtures,
-            banks: Banks::new(genesis),
+            banks: Banks::new(genesis.clone()),
             nodes,
             msg_buffer: BTreeSet::new(),
+            genesis,
+            pools: BTreeMap::new(),
             stats: ReplayStats::default(),
             _instance: PhantomData,
         }
@@ -337,10 +465,23 @@ impl<I: Instance> VotorMbtDriver<I> {
 
     /// Spec `init`: the trace's blocks are `blocks`, and every benevolent process starts with
     /// `ParentReady(-1)` at slot 0.
+    ///
+    /// With `I::WITH_POOL`, every node also gets a fresh consensus pool (a `ConsensusPool` cannot
+    /// be reset). The pools start with the same parent ready, which the driver sends to the event
+    /// handlers itself, as the consensus pool service does.
     fn init(&mut self, blocks: BTreeSet<SpecBlock>) -> Result {
+        self.stats
+            .record_pool_certificates(self.pools.values().flat_map(NodePool::certificate_types));
         self.stats.start_trace(&blocks, I::NUM_SLOTS);
         self.banks.reset(blocks)?;
         self.msg_buffer.clear();
+        self.pools.clear();
+        if I::WITH_POOL {
+            for (id, node) in &self.nodes {
+                let pool = NodePool::new(node.cluster_info.clone(), &self.genesis);
+                self.pools.insert(id.clone(), pool);
+            }
+        }
         let ids: Vec<String> = self.nodes.keys().cloned().collect();
         for id in ids {
             self.node(&id)?.reset();
@@ -360,11 +501,53 @@ impl<I: Instance> VotorMbtDriver<I> {
     }
 
     fn block_notarized(&mut self, v: &str, b: SpecBlock) -> Result {
-        self.handle(v, VotorEvent::BlockNotarized(block_ref(b.slot, b.hash)))
+        let block = block_ref(b.slot, b.hash);
+        if !I::WITH_POOL {
+            return self.handle(v, VotorEvent::BlockNotarized(block));
+        }
+        let event = PoolEvent::BlockNotarized(block);
+        if let Some(event) = self.dispatch_pool_event("blockNotarizedAction", v, event)? {
+            self.handle(v, event)?;
+        }
+        Ok(())
     }
 
     fn parent_ready(&mut self, v: &str, slot: i64, b: SpecBlock) -> Result {
-        self.parent_ready_event(v, agave_slot(slot), block_ref(b.slot, b.hash))
+        let slot = agave_slot(slot);
+        let parent = block_ref(b.slot, b.hash);
+        if !I::WITH_POOL {
+            return self.parent_ready_event(v, slot, parent);
+        }
+        let event = PoolEvent::ParentReady { slot, parent };
+        if self
+            .dispatch_pool_event("parentReadyAction", v, event)?
+            .is_some()
+        {
+            self.parent_ready_event(v, slot, parent)?;
+        }
+        Ok(())
+    }
+
+    /// For a spec action that delivers the derived event `event` to process `v`, returns the
+    /// event for `v`'s event handler: `v`'s pool must have emitted it, and it is returned the
+    /// first time only. The spec may deliver the same derived event again, while agave delivers
+    /// it once. With spec patches 5 and 6 a repeated input leaves the spec's state unchanged, so
+    /// not passing it on again is checked by the state comparison.
+    fn dispatch_pool_event(
+        &mut self,
+        action: &str,
+        v: &str,
+        event: PoolEvent,
+    ) -> Result<Option<VotorEvent>> {
+        let pool = self
+            .pools
+            .get_mut(v)
+            .ok_or_else(|| anyhow!("no pool for spec process {v:?}"))?;
+        let dispatch = pool
+            .take_for_dispatch(&event)
+            .map_err(|err| anyhow!("spec fired {action} for {v}, but {v}'s pool {err}"))?;
+        self.stats.record_pool_dispatch(&event, dispatch.is_some());
+        Ok(dispatch)
     }
 
     fn safe_to_notar(&mut self, v: &str, b: SpecBlock) -> Result {
@@ -410,6 +593,7 @@ impl<I: Instance> VotorMbtDriver<I> {
                 panic_message(&*payload)
             ),
         };
+        let mut pushed = Vec::new();
         for op in ops {
             match op {
                 BLSOp::PushVote { vote } => {
@@ -426,11 +610,46 @@ impl<I: Instance> VotorMbtDriver<I> {
                         "{description}: pushed {msg:?} again"
                     );
                     self.msg_buffer.insert(msg);
+                    pushed.push(vote);
                 }
                 BLSOp::PushCertificates { .. }
                 | BLSOp::RefreshVotes { .. }
                 | BLSOp::RefreshCertificates { .. } => {
                     bail!("unexpected BLSOp on {description}: {op:?}")
+                }
+            }
+        }
+        if I::WITH_POOL {
+            self.deliver_votes(v, &description, pushed)?;
+        }
+        Ok(())
+    }
+
+    /// Delivers the votes `v` pushed in one step to every pool, one vote at a time and in the
+    /// order they were cast, as the spec's global message soup does. `v`'s own pool gets each
+    /// vote as the `VoteMessage` the event handler sent on its own-vote channel, and every other
+    /// pool gets it as a `VoteAggregate`, as bls-sigverify forwards a vote received from the
+    /// network.
+    fn deliver_votes(
+        &mut self,
+        v: &str,
+        description: &str,
+        pushed: Vec<Arc<VoteMessage>>,
+    ) -> Result {
+        let own: Vec<VoteMessage> = self.node(v)?.own_vote_receiver.try_iter().collect();
+        ensure!(
+            own.len() == pushed.len() && own.iter().zip(&pushed).all(|(o, p)| o.vote == p.vote),
+            "{description}: sent {own:?} to its own pool but pushed {pushed:?}"
+        );
+        for (own, pushed) in own.into_iter().zip(pushed) {
+            for (u, pool) in &mut self.pools {
+                let vote = if u == v {
+                    PoolVote::Own(own.clone())
+                } else {
+                    PoolVote::External(new_vote_aggregate(&self.genesis, (*pushed).clone()))
+                };
+                for event in pool.add_votes(&self.genesis, vec![vote])? {
+                    self.stats.record_pool_emitted(&event);
                 }
             }
         }
@@ -587,6 +806,8 @@ impl<I: Instance> VotorMbtDriver<I> {
 
 impl<I: Instance> Drop for VotorMbtDriver<I> {
     fn drop(&mut self) {
+        self.stats
+            .record_pool_certificates(self.pools.values().flat_map(NodePool::certificate_types));
         self.stats.finish_trace();
         let ReplayStats {
             actions,
@@ -595,6 +816,9 @@ impl<I: Instance> Drop for VotorMbtDriver<I> {
             tree_shapes,
             traces_with,
             current_trace: _,
+            pool_emitted,
+            pool_dispatched,
+            pool_repeated,
         } = &self.stats;
         let tree_shapes: Vec<String> = TreeShape::ALL
             .iter()
@@ -607,9 +831,18 @@ impl<I: Instance> Drop for VotorMbtDriver<I> {
             .iter()
             .map(|(name, &count)| format!("{name} {count} ({}%)", percent(count, *traces)))
             .collect();
+        let pools = if I::WITH_POOL {
+            format!(
+                ", pool events emitted {pool_emitted:?}, dispatched {pool_dispatched:?}, asked \
+                 for again {pool_repeated:?}"
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
             "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}, traces {traces}, \
-             traces whose block tree has: {}, traces with each action or vote: {}",
+             traces whose block tree has: {}, traces with each action, vote, dispatched pool \
+             event, or pool certificate: {}{pools}",
             I::STATE_PATH.join("."),
             tree_shapes.join(", "),
             traces_with.join(", "),
@@ -683,4 +916,22 @@ fn mbt_votor_agave_window() -> impl Driver {
 )]
 fn mbt_votor_agave_gen() -> impl Driver {
     VotorMbtDriver::<AgaveGen>::new()
+}
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+///
+/// Like `mbt_votor_agave_gen`, without Byzantine processes, and with a consensus pool per node
+/// that decides which `BlockNotarized` and `ParentReady` events exist (spec patch 12).
+#[ignore]
+#[quint_run(
+    spec = "src/event_handler/mbt/spec/statemachine.qnt",
+    main = "agave_pool",
+    init = "initGenerated",
+    max_samples = 150,
+    max_steps = 60
+)]
+fn mbt_votor_agave_pool() -> impl Driver {
+    VotorMbtDriver::<AgavePool>::new()
 }
