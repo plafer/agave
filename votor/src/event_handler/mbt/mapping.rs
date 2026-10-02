@@ -12,7 +12,11 @@
 
 use {
     super::spec_types::{BlockRef, Certificate, Message},
-    agave_votor_messages::{certificate::CertificateType, consensus_message::Block, vote::Vote},
+    agave_votor_messages::{
+        certificate::CertificateType,
+        consensus_message::{Block, BlockId},
+        vote::Vote,
+    },
     anyhow::{Context, Result, anyhow, bail, ensure},
     serde::Deserialize,
     solana_clock::Slot,
@@ -60,8 +64,9 @@ pub(super) fn hash_of(h: i64) -> Hash {
 }
 
 /// Inverse of [`hash_of`].
-pub(super) fn spec_hash(hash: &Hash) -> Result<i64> {
-    if *hash == Hash::default() {
+pub(super) fn spec_hash(block_id: &BlockId) -> Result<i64> {
+    let hash = block_id.to_hash();
+    if hash == Hash::default() {
         return Ok(GENESIS_HASH);
     }
     let bytes = hash.as_bytes();
@@ -74,7 +79,7 @@ pub(super) fn spec_hash(hash: &Hash) -> Result<i64> {
 }
 
 /// Maps an agave block back onto a spec block reference.
-fn spec_block_ref(block: &Block) -> Result<BlockRef> {
+pub(super) fn spec_block_ref(block: &Block) -> Result<BlockRef> {
     Ok(BlockRef {
         slot: spec_slot(block.slot)?,
         hash: spec_hash(&block.block_id)?,
@@ -273,6 +278,17 @@ impl Banks {
     /// The trace's blocks.
     pub(super) fn blocks(&self) -> &BTreeSet<SpecBlock> {
         &self.blocks
+    }
+
+    /// The parent of `block` as its bank reports it, which is what the blockstore's `SlotMeta`
+    /// holds once a node has the full block. `None` if `block` is not one of the trace's blocks.
+    pub(super) fn parent_of(&self, block: &Block) -> Option<Block> {
+        let bank = self.by_hash.get(&spec_hash(&block.block_id).ok()?)?;
+        (bank.slot() == block.slot).then(|| Block {
+            slot: bank.parent_slot(),
+            // The event handler reads the parent the same way (`get_block_parent_block`).
+            block_id: bank.parent_block_id().unwrap_or_default().into(),
+        })
     }
 }
 

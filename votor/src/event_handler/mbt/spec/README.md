@@ -16,9 +16,8 @@ does not typecheck at the upstream commit.
 
 Every change to the vendored files is listed here, with the reason for it.
 Each changed spot is marked with an `agave patch N` comment. Patches 1, 2,
-4, 5, 6, 11, 14, 17, and 18 are to be reported upstream. Numbers 15 and 16
-are reserved for later patches that compare agave's consensus pool with the
-spec; patches 17 and 18 were needed first.
+4, 5, 6, 11, 14, 15, 16, 17, and 18 are to be reported upstream. Patches 17
+and 18 were applied before 15 and 16, which kept the numbers planned for them.
 
 ### Patch 1: pending blocks are a per-slot list, tried in arrival order
 
@@ -268,7 +267,8 @@ or more.
 ### Patch 13: the environment has a pool view
 
 `statemachine.qnt` (`PoolView`, `Environment`, `poolView`, `withPoolView`,
-`initWith`, `fireTimeoutEvent`, `processInput`).
+`initWith`, `fireTimeoutEvent`, `processInput`, `safeToNotarHolds`,
+`safeToSkipHolds`).
 
 Not a fix, and not to be reported upstream. The model-based tests compare
 agave's consensus pools with the spec, but ITF traces only record state
@@ -279,16 +279,23 @@ The patch adds a `pool` field to `Environment` that `initWith`,
 certificate on one of the trace's blocks, and every skip and finalization
 certificate on an alive slot, for which `isCertified` holds over
 `msgBuffer` and the Byzantine soup, and every pair `(s, hash(b))` with `b` in
-`parentReadyBlocks(s, ...)`, plus the `(0, -1)` that `init` preloads. Each
-candidate certificate is checked against the messages of its own slot only,
-which gives the same result faster.
+`parentReadyBlocks(s, ...)`, plus the `(0, -1)` that `init` preloads. For
+every benevolent process, it also holds the blocks for which
+`safeToNotarCondition` holds and the slots for which `safeToSkipCondition`
+holds; unlike the rest, these depend on the process's own votes. To evaluate
+them, the bodies of the two conditions moved into the pure
+`safeToNotarHolds` and `safeToSkipHolds`, which take the messages as a
+parameter. Each candidate certificate and each condition is checked against
+the messages of its own slot only (plus, for `SafeToNotar`, the parent's
+certificate, patch 16), which gives the same result faster.
 
 No action reads the field, so no trace changes apart from it: with and without
 the patch, `quint run --mbt` produces the same actions, picks, and states
 (ignoring `pool`) for 50 traces of each of the five instances, at seeds
-`0x1234` and `0x4321`. The view is only computed in instances without
-Byzantine processes, the ones where the model-based tests run agave's pools
-(patch 12). Elsewhere it stays empty, because evaluating it over the Byzantine
+`0x1234` and `0x4321`. The same check passes with the safe-to sets added and
+the conditions moved into pure definitions (without patches 15 and 16). The
+view is only computed in instances without Byzantine processes, the ones where
+the model-based tests run agave's pools (patch 12). Elsewhere it stays empty, because evaluating it over the Byzantine
 soup made `quint run` on `agave_gen` take about 28 s instead of 11 s for 180
 traces.
 
@@ -314,6 +321,61 @@ its timeouts. This changes traces of `agave_window`, `agave_gen`, and
 `agave_pool`: at seed `0x1234`, `parentReadyAction` for genesis occurs in 16,
 8, and 11 of 50 traces. The upstream instances have no second window, so
 their traces do not change. The gap is latent upstream for the same reason.
+
+### Patch 15: `safeToNotarCondition` only rules out a notarize vote for the block itself
+
+`statemachine.qnt` (`safeToNotarHolds`, the body of `safeToNotarCondition`).
+
+The paper (Definition 16) issues `SafeToNotar(s, hash(b))` only "if the node
+voted in slot s already, but not to notarize b", and the comment in the spec
+says the same. Upstream requires that the process sent no `NotarVoteMsg` at
+all in the slot, so a process that voted to notarize another block of the slot
+never casts a notar-fallback vote for `b`, however many votes `b` gets. Agave's
+pool emits `SafeToNotar(b)` unless the node's first vote in the slot was a
+notarize vote for `b` itself. With the safe-to sets in the pool view (patch
+13), runs of `agave_pool` failed this way, for example with
+`pool.safeToNotar[v4]: only in agave: BlockRef { slot: 0, hash: 100 }`
+(`QUINT_SEED=0xd047106b`, and `0x1adadb24`): v4 had voted to notarize 101,
+and v1 and v2 had voted for 100, 5 of 9 and so at least 40%. The patch only rules out a
+`NotarVoteMsg` for `b`. It changes the condition for every instance.
+
+### Patch 16: outside the first slot of a window, `SafeToNotar` waits for the parent's certificate
+
+`statemachine.qnt` (`safeToNotarHolds`, `parentNotarFallbackCertified`,
+`safeToNotarCondition`, `poolView`).
+
+The paper's Definition 16 continues: if `s` is the first slot of its leader
+window, the event is emitted; otherwise block `b` is first retrieved by
+repair, to learn its parent, and the event is emitted once Pool also holds a
+notar-fallback certificate for the parent. Upstream ignores the parent. Agave
+does what the paper says: its pool holds such a block back, and the consensus
+pool service emits `SafeToNotar` once repair has the block and the parent has a
+notar-fallback certificate or a stronger one. In the model-based tests,
+`agave_pool` failed this way, for example with
+`pool.safeToNotar[v3]: only in the spec: BlockRef { slot: 2, hash: 120 }`
+(`QUINT_SEED=0xd8b94300`): v3 had skipped slot 2, block 120 had 5 of 9
+notarize votes, and its parent 110 had 5 of 9 too, short of a certificate.
+The patch adds, outside the first slot of a window,
+`parentNotarFallbackCertified(b, ...)`: a `NotarFallbackCertificate` on the
+parent (which a notarization or fast-finalization certificate implies, since
+their votes count towards it), with the genesis parent (hash -1) counted as
+certified, as `init` and patch 14 do. A parent that is not one of the
+environment's blocks has no certificate, since no correct process votes for
+it. It changes the condition for every instance. Together, patches 15 and 16
+change 44, 39, 18, 46, and 47 of 50 traces of `some_byz`, `some_byz_vp`,
+`agave_window`, `agave_gen`, and `agave_pool` (seed `0x1234`).
+
+The paper is paraphrased here, not quoted: no copy of it was at hand when the
+patch was written. Agave's `consensus_pool/slot_stake_counters.rs` quotes the
+first part of Definition 16 (white paper v1.1, page 22), and
+`consensus_pool_service.rs` implements the deferral. The citation is to be
+checked against the paper before reporting the patch upstream.
+
+The service also drops a waiting block once the block's slot is at or below
+the highest finalized slot. The spec has no such cutoff, and this is not a
+spec patch, because the cutoff is an optimization (the notar-fallback vote it
+avoids is in a finalized slot). The model-based tests document it as a
+trusted difference and stand in for agave there (see the `mbt` module doc).
 
 ### Patch 17: `safeToSkipCondition` requires that the process did not vote to skip
 
@@ -353,6 +415,17 @@ skip-fallback votes certify slot 0. The patch also collects the slots of
 `SkipFallbackVoteMsg`. `parentReadyBlocks` is the only reader, so this
 changes `parentReadyAction`, in every instance with a second window. The bug
 is upstream too, and is to be reported upstream.
+
+### Not patched: `safeToSkipCondition` excludes the block with the most voters
+
+`safeToSkipCondition` computes `skip(s) + Σ notar(b) − max notar(b)` over
+sender sets, and picks the block to leave out by the number of its notarize
+voters (`votedToNotar(x, ...).size()`), while the paper and agave leave out
+the block with the most notarize stake. With unequal stakes the two can pick
+different blocks. In `agave_pool` (stakes 3, 2, 2, and 2) this never changes
+whether the 40% threshold is reached, so the model-based tests cannot see it
+and the spec is left as it is (see the `mbt` module doc). It is to be reported
+upstream together with the patches.
 
 ### Addition: the `agave_window` instance
 

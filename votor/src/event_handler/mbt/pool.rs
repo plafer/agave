@@ -8,6 +8,15 @@
 //! event among the ones the node's pool emitted, and the driver passes the pool's event to the
 //! node's event handler once.
 //!
+//! For a block that is not in the first slot of its leader window, a pool does not emit
+//! `SafeToNotar` itself. It hands the block to the consensus pool service, which asks repair for
+//! the block, and emits `SafeToNotar` once the block's parent has a notar-fallback certificate or
+//! a stronger one ([`resolve_pending_safe_to_notar`]). The driver runs that resolution after
+//! every vote, looks the parent up in the trace's banks, as if repair fetched the block at once,
+//! and sends no repair request. The service also drops a waiting block once its slot is at or
+//! below the highest finalized slot, which the spec does not do; the driver then stands in for
+//! agave (see `NodePool::past_finalized`).
+//!
 //! Pools only run in instances without Byzantine processes. The spec's Byzantine soup lets a
 //! Byzantine process send every possible vote, including conflicting ones, and the spec's
 //! conditions count each sender once. Agave's pool adds up stake per vote, so a rank that sends,
@@ -18,12 +27,14 @@
 
 use {
     super::{
-        mapping::{GENESIS_HASH, OFFSET, spec_hash, spec_slot, to_spec_certificate},
-        spec_types::{Certificate, PoolView},
+        mapping::{
+            GENESIS_HASH, OFFSET, spec_block_ref, spec_hash, spec_slot, to_spec_certificate,
+        },
+        spec_types::{BlockRef, Certificate, PoolView},
     },
     crate::{
         consensus_pool::ConsensusPool,
-        consensus_pool_service::{PoolMessage, PoolVote},
+        consensus_pool_service::{PoolMessage, PoolVote, resolve_pending_safe_to_notar},
         event::VotorEvent,
     },
     agave_bls_sigverify::generated_cert_types::GeneratedCertTypes,
@@ -34,7 +45,10 @@ use {
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_runtime::bank::Bank,
-    std::{collections::BTreeSet, sync::Arc},
+    std::{
+        collections::{BTreeMap, BTreeSet, HashSet},
+        sync::Arc,
+    },
 };
 
 /// A derived event a pool emitted, in spec-independent agave terms.
@@ -103,10 +117,36 @@ impl PoolEvent {
 /// passed on to the node's event handler.
 pub(super) struct NodePool {
     pool: ConsensusPool,
-    /// Every event the pool emitted since `init`.
+    /// Every event the pool emitted since `init`, together with the `SafeToNotar` events the
+    /// driver stands in for (see `past_finalized`).
     emitted: BTreeSet<PoolEvent>,
     /// The emitted events that were passed to the node's event handler.
     dispatched: BTreeSet<PoolEvent>,
+    /// The blocks the pool found safe to notarize, outside the first slot of their window, that
+    /// wait for their parent's notar-fallback certificate: the consensus pool service's
+    /// `pending_safe_to_notar`.
+    pending_safe_to_notar: HashSet<Block>,
+    /// The pending blocks that agave dropped, without checking their parent, because their slot
+    /// is at or below the highest finalized slot. The spec has no such cutoff, so the driver
+    /// stands in for agave here: it keeps checking the parent of each of these blocks with the
+    /// pool's own `block_has_notar_fallback_or_stronger`, and adds `SafeToNotar` to `emitted`
+    /// once that holds, as agave would without the cutoff.
+    past_finalized: HashSet<Block>,
+}
+
+/// What [`NodePool::add_votes`] did.
+#[derive(Default)]
+pub(super) struct AddedVotes {
+    /// The events that the pool had not emitted before.
+    pub(super) new_events: Vec<PoolEvent>,
+    /// The number of `SafeToNotar` events among them that waited for the block's parent.
+    pub(super) pending_resolved: usize,
+    /// The number of pending blocks that agave dropped because their slot is at or below the
+    /// highest finalized slot.
+    pub(super) pending_dropped: usize,
+    /// The number of `SafeToNotar` events the driver added for dropped blocks, once their parent
+    /// was certified. They are not in `new_events`.
+    pub(super) stood_in: usize,
 }
 
 impl NodePool {
@@ -126,20 +166,52 @@ impl NodePool {
             pool,
             emitted: BTreeSet::new(),
             dispatched: BTreeSet::new(),
+            pending_safe_to_notar: HashSet::new(),
+            past_finalized: HashSet::new(),
         }
     }
 
     /// Adds `votes` to the pool, as the consensus pool service does, and records the events the
-    /// pool emits. Returns the events that the pool had not emitted before.
+    /// pool emits. Then resolves the blocks that wait for their parent's certificate, with
+    /// `parent_of` standing in for the blockstore, as the service does in each iteration of its
+    /// loop.
     pub(super) fn add_votes(
         &mut self,
         root_bank: &Bank,
         votes: Vec<PoolVote>,
-    ) -> Result<Vec<PoolEvent>> {
+        parent_of: impl Fn(&Block) -> Option<Block>,
+    ) -> Result<AddedVotes> {
         self.pool.maybe_prune(root_bank.slot());
         let mut events = Vec::new();
         self.pool
             .add_pool_msg(root_bank, PoolMessage::Votes(votes), &mut events);
+        // The service sends a repair request for each new block here.
+        self.pending_safe_to_notar
+            .extend(self.pool.take_pending_safe_to_notar());
+        let pending = self.pending_safe_to_notar.clone();
+        let resolved_from = events.len();
+        let pending_resolved = resolve_pending_safe_to_notar(
+            &self.pool,
+            &mut self.pending_safe_to_notar,
+            &parent_of,
+            &mut events,
+        );
+        let resolved: HashSet<Block> = events[resolved_from..]
+            .iter()
+            .filter_map(|event| match event {
+                VotorEvent::SafeToNotar(block) => Some(*block),
+                _ => None,
+            })
+            .collect();
+        let dropped: Vec<Block> = pending
+            .into_iter()
+            .filter(|block| {
+                !self.pending_safe_to_notar.contains(block) && !resolved.contains(block)
+            })
+            .collect();
+        let pending_dropped = dropped.len();
+        self.past_finalized.extend(dropped);
+
         let mut new_events = Vec::new();
         for event in events {
             let event = PoolEvent::from_votor_event(event)?;
@@ -147,7 +219,28 @@ impl NodePool {
                 new_events.push(event);
             }
         }
-        Ok(new_events)
+
+        let pool = &self.pool;
+        let mut stood_in = Vec::new();
+        self.past_finalized.retain(|block| {
+            let certified = parent_of(block)
+                .is_some_and(|parent| pool.block_has_notar_fallback_or_stronger(parent));
+            if certified {
+                stood_in.push(PoolEvent::SafeToNotar(*block));
+            }
+            !certified
+        });
+        let stood_in = stood_in
+            .into_iter()
+            .filter(|event| self.emitted.insert(*event))
+            .count();
+
+        Ok(AddedVotes {
+            new_events,
+            pending_resolved,
+            pending_dropped,
+            stood_in,
+        })
     }
 
     /// Returns `event` for the node's event handler the first time it is asked for, and `None`
@@ -178,10 +271,11 @@ impl NodePool {
         self.pool.completed_certificate_types()
     }
 
-    /// Projects the pool onto the spec's `PoolView` for spec slots `0..num_slots`: the
-    /// certificates it holds, and the parent-ready pairs it emitted together with the initial
-    /// one. Certificates and pairs past the last spec slot are left out, since the spec has no
-    /// state there.
+    /// Projects the pool onto the parts of the spec's `PoolView` that every pool shares, for spec
+    /// slots `0..num_slots`: the certificates it holds, and the parent-ready pairs it emitted
+    /// together with the initial one. The per-process `safeToNotar` and `safeToSkip` are left
+    /// empty (see [`NodePool::safe_to_view`]). Certificates and pairs past the last spec slot are
+    /// left out, since the spec has no state there.
     ///
     /// The spec's certificates are conditions on the votes, and a notarization certificate's
     /// votes also make a notar-fallback certificate. Agave builds at most one of the
@@ -191,12 +285,7 @@ impl NodePool {
     /// project onto `NotarizationCertificate`: agave does not treat it as one, and emits no
     /// `BlockNotarized` for it.
     pub(super) fn view(&self, num_slots: usize) -> Result<PoolView> {
-        let in_spec = |slot: Slot| {
-            spec_slot(slot)
-                .ok()
-                .and_then(|s| usize::try_from(s).ok())
-                .is_some_and(|s| s < num_slots)
-        };
+        let in_spec = |slot: Slot| in_spec(slot, num_slots);
         let mut certificates = BTreeSet::new();
         for certificate in self.certificate_types() {
             if !in_spec(certificate.slot()) {
@@ -225,6 +314,41 @@ impl NodePool {
         Ok(PoolView {
             certificates,
             parent_ready,
+            safe_to_notar: BTreeMap::new(),
+            safe_to_skip: BTreeMap::new(),
         })
     }
+
+    /// Projects the pool onto its node's entries of the spec's `safeToNotar` and `safeToSkip`,
+    /// for spec slots `0..num_slots`: the blocks and slots of every `SafeToNotar` and
+    /// `SafeToSkip` the pool emitted. A pool emits each of them once, when its condition first
+    /// holds, and the spec's conditions never stop holding for a correct process, so the events
+    /// emitted so far are the ones whose conditions hold now.
+    pub(super) fn safe_to_view(
+        &self,
+        num_slots: usize,
+    ) -> Result<(BTreeSet<BlockRef>, BTreeSet<i64>)> {
+        let mut safe_to_notar = BTreeSet::new();
+        let mut safe_to_skip = BTreeSet::new();
+        for event in &self.emitted {
+            match event {
+                PoolEvent::SafeToNotar(block) if in_spec(block.slot, num_slots) => {
+                    safe_to_notar.insert(spec_block_ref(block)?);
+                }
+                PoolEvent::SafeToSkip(slot) if in_spec(*slot, num_slots) => {
+                    safe_to_skip.insert(spec_slot(*slot)?);
+                }
+                _ => {}
+            }
+        }
+        Ok((safe_to_notar, safe_to_skip))
+    }
+}
+
+/// Whether agave slot `slot` is one of the spec slots `0..num_slots`.
+fn in_spec(slot: Slot, num_slots: usize) -> bool {
+    spec_slot(slot)
+        .ok()
+        .and_then(|s| usize::try_from(s).ok())
+        .is_some_and(|s| s < num_slots)
 }

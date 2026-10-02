@@ -500,45 +500,21 @@ impl ConsensusPoolService {
             }
         }
 
-        let highest_finalized = consensus_pool
-            .highest_finalized_slot()
-            .map(|s| s.slot())
-            .unwrap_or(0);
-
-        pending_safe_to_notar.retain(|&block| {
-            // Discard if slot is at or below highest finalized
-            if block.slot <= highest_finalized {
-                return false;
-            }
-
-            // Check if we've received the full block in blockstore
-            let Some((slot_meta, _location)) = ctx
+        // A block's parent is known once the full block is in the blockstore.
+        let parent_of = |block: &Block| {
+            let (slot_meta, _location) = ctx
                 .blockstore
                 .get_slot_meta_for_block_id(block.slot, block.block_id.to_hash())
-                .expect("Blockstore operations must succeed")
-            else {
-                // Block not yet received, keep waiting
-                return true;
-            };
-
-            let parent_block = Block {
+                .expect("Blockstore operations must succeed")?;
+            Some(Block {
                 slot: slot_meta
                     .parent_slot
                     .expect("parent slot must exist for full blocks"),
                 block_id: BlockId::from(slot_meta.parent_block_id),
-            };
-
-            // Check if the parent has a NotarizeFallback certificate (or stronger)
-            if consensus_pool.block_has_notar_fallback_or_stronger(parent_block) {
-                // All conditions met - emit SafeToNotar event
-                events.push(VotorEvent::SafeToNotar(block));
-                stats.pending_safe_to_notar_resolved += 1;
-                return false;
-            }
-
-            // Parent doesn't have the certificate yet, keep waiting
-            true
-        });
+            })
+        };
+        stats.pending_safe_to_notar_resolved +=
+            resolve_pending_safe_to_notar(consensus_pool, pending_safe_to_notar, parent_of, events);
 
         Ok(())
     }
@@ -709,6 +685,48 @@ impl ConsensusPoolService {
             default(wait_timeout) => Ok(()),
         }
     }
+}
+
+/// Steps 2 to 5 of [`ConsensusPoolService::process_pending_safe_to_notar`].
+///
+/// Emits `SafeToNotar` for each pending block whose parent has a notar-fallback-or-stronger
+/// certificate, and drops blocks at or below the highest finalized slot. `parent_of` returns
+/// `None` while the block has not been received. Returns the number of blocks resolved.
+pub(crate) fn resolve_pending_safe_to_notar(
+    consensus_pool: &ConsensusPool,
+    pending_safe_to_notar: &mut HashSet<Block>,
+    parent_of: impl Fn(&Block) -> Option<Block>,
+    events: &mut Vec<VotorEvent>,
+) -> usize {
+    let highest_finalized = consensus_pool
+        .highest_finalized_slot()
+        .map(|s| s.slot())
+        .unwrap_or(0);
+
+    let mut resolved: usize = 0;
+    pending_safe_to_notar.retain(|block| {
+        // Discard if slot is at or below highest finalized
+        if block.slot <= highest_finalized {
+            return false;
+        }
+
+        let Some(parent_block) = parent_of(block) else {
+            // Block not yet received, keep waiting
+            return true;
+        };
+
+        // Check if the parent has a NotarizeFallback certificate (or stronger)
+        if consensus_pool.block_has_notar_fallback_or_stronger(parent_block) {
+            // All conditions met - emit SafeToNotar event
+            events.push(VotorEvent::SafeToNotar(*block));
+            resolved = resolved.saturating_add(1);
+            return false;
+        }
+
+        // Parent doesn't have the certificate yet, keep waiting
+        true
+    });
+    resolved
 }
 
 fn root_block(root_bank: &Bank) -> Block {
@@ -1361,6 +1379,39 @@ mod tests {
             ConsensusPoolContext::_initial_parent_ready(genesis_block, root_block, Some(stale)),
             (13, root_block)
         );
+    }
+
+    #[test]
+    fn test_resolve_pending_safe_to_notar() {
+        let TestContext {
+            consensus_pool,
+            ctx,
+            ..
+        } = TestContext::default();
+        // The initial parent ready's block has a notar-fallback certificate.
+        let (_, certified_parent) = ctx.initial_parent_ready();
+        let uncertified_parent = Block::new_unique(2);
+        let not_received = Block::new_unique(2);
+        let ready = Block::new_unique(3);
+        let waiting = Block::new_unique(3);
+        let mut pending = HashSet::from([not_received, ready, waiting]);
+        let parent_of = |block: &Block| {
+            if *block == ready {
+                Some(certified_parent)
+            } else if *block == waiting {
+                Some(uncertified_parent)
+            } else {
+                None
+            }
+        };
+
+        let mut events = vec![];
+        let resolved =
+            resolve_pending_safe_to_notar(&consensus_pool, &mut pending, parent_of, &mut events);
+
+        assert_eq!(resolved, 1);
+        assert!(matches!(events.as_slice(), [VotorEvent::SafeToNotar(block)] if *block == ready));
+        assert_eq!(pending, HashSet::from([not_received, waiting]));
     }
 
     #[test]

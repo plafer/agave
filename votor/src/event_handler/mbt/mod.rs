@@ -11,10 +11,11 @@
 //! and blocks map onto agave values.
 //!
 //! In the `agave_pool` instance, every node also runs its own `ConsensusPool` (see `pool.rs`),
-//! which receives every vote any node pushes. There, a spec action that delivers
-//! `BlockNotarized` or `ParentReady` passes on the event the node's pool emitted, instead of
-//! building it from the action's picks, and after every step the pools must hold what the spec's
-//! pool view (spec patch 13) holds.
+//! which receives every vote any node pushes. There, every derived event the event handler
+//! receives (`BlockNotarized`, `ParentReady`, `SafeToNotar`, and `SafeToSkip`) is one the node's
+//! pool emitted: the spec action that delivers it passes on the pool's event, instead of building
+//! it from the action's picks. After every step the pools must hold what the spec's pool view
+//! (spec patch 13) holds.
 //!
 //! # Running
 //!
@@ -38,12 +39,11 @@
 //! - no node pushes a vote it already pushed since `init`. The spec's `msgBuffer` is a set, so a
 //!   repeated vote would otherwise go unnoticed; with spec patches 5 and 6 a correct spec process
 //!   never broadcasts the same message twice either;
-//! - in `agave_pool`, every `blockNotarizedAction` and `parentReadyAction` finds the matching
-//!   `BlockNotarized` or `ParentReady` among the events the node's pool emitted, so the pool is at
-//!   least as live as the spec for these two events. The event is passed to the event handler the
-//!   first time the spec delivers it, and not again, as in agave; with spec patches 5 and 6 a
-//!   repeated input leaves the spec's compared state unchanged. The votes a node sends its own
-//!   pool must also be the votes it pushes;
+//! - in `agave_pool`, every `blockNotarizedAction`, `parentReadyAction`, `safeToNotarAction`, and
+//!   `safeToSkipAction` finds the matching event among the events the node's pool emitted. The
+//!   event is passed to the event handler the first time the spec delivers it, and not again, as
+//!   in agave; with spec patches 5 and 6 a repeated input leaves the spec's compared state
+//!   unchanged. The votes a node sends its own pool must also be the votes it pushes;
 //! - in `agave_pool`, all pools hold the same certificates and have emitted the same
 //!   `ParentReady` events, since each of them received every vote.
 //!
@@ -54,25 +54,36 @@
 //! - `system`: for every benevolent process and every spec slot, the `VoteHistory` flags (voted,
 //!   voted-notar, block-notarized, parent-ready, its-over, bad-window, notar-fallback voted,
 //!   skip-fallback voted) and `LocalContext::pending_blocks` in arrival order;
-//! - `pool`, in `agave_pool` only: the certificates the pools hold, and the `(slot, parent)`
-//!   pairs of every `ParentReady` they emitted, plus the initial one. The spec's view is the
-//!   certificates and parent-ready pairs over all messages, so the pools must be exactly as live
-//!   as the spec for both. A pool builds only the strongest of the certificates a block's
-//!   notarize votes make, so its `Notarize` and `FinalizeFast` certificates also count as the
-//!   block's notar-fallback certificate, as agave's `ParentReadyTracker` counts them. Agave
-//!   does not count `FinalizeFast` as `Notarize`, and neither does the projection.
+//! - `pool`, in `agave_pool` only: the certificates the pools hold, the `(slot, parent)` pairs of
+//!   every `ParentReady` they emitted, plus the initial one, and per node the blocks and slots of
+//!   every `SafeToNotar` and `SafeToSkip` the node's pool emitted. The spec's view is the
+//!   certificates and the enabled events over all messages, so the pools must be exactly as live
+//!   as the spec for all four derived events. A pool builds only the strongest of the
+//!   certificates a block's notarize votes make, so its `Notarize` and `FinalizeFast`
+//!   certificates also count as the block's notar-fallback certificate, as agave's
+//!   `ParentReadyTracker` counts them. Agave does not count `FinalizeFast` as `Notarize`, and
+//!   neither does the projection.
 //!
 //! # Trusted, not checked
 //!
 //! - The consensus pool, outside `agave_pool`. Certificates, parent-ready, safe-to-notar, and
 //!   safe-to-skip are decided by the spec's environment over its message soup (which includes
 //!   every possible Byzantine vote) and injected as events.
-//! - In `agave_pool`: `SafeToNotar` and `SafeToSkip`, which still come from the spec's picks (the
-//!   pools emit them too, and they are counted but not used), so agave's deferral of
-//!   intra-window `SafeToNotar` until the parent is verified is not exercised; `BlockNotarFallback`
-//!   and `Finalized`, which the pools emit but are never dispatched (only the certificates they
-//!   follow from are compared); anything the pools hold past the last spec slot; and Byzantine
-//!   voters, which `agave_pool` does not have (see `pool.rs`).
+//! - In `agave_pool`:
+//!   - `BlockNotarFallback` and `Finalized`, which the pools emit but are never dispatched; only
+//!     the certificates they follow from are compared;
+//!   - anything the pools hold or emit past the last spec slot;
+//!   - Byzantine voters, which `agave_pool` does not have (see `pool.rs`);
+//!   - bls-sigverify and the consensus pool service around the pools, which the driver replaces
+//!     (see "Glue between the pools" below);
+//!   - agave's cutoff for intra-window `SafeToNotar`: the service drops a block that waits for its
+//!     parent's certificate once the block's slot is at or below the highest finalized slot. The
+//!     spec has no such cutoff, and enables the event (a notar-fallback vote in a finalized slot,
+//!     which changes nothing). It is reachable: without the stand-in below, 2 of 6 runs of 150
+//!     traces failed because a node skipped a slot that was already finalized. For the blocks
+//!     agave drops this way, the driver keeps
+//!     applying agave's own parent check (`block_has_notar_fallback_or_stronger`) and counts the
+//!     `SafeToNotar` as emitted once it holds, so the comparison sees agave without the cutoff.
 //! - The timer manager. The spec's `activeTimeouts` is a set of slots that may fire in any order,
 //!   while agave arms one two-phase timer per window that fires in slot order by wall-clock
 //!   time. `activeTimeouts` is not compared. Instead `fireTimeoutEvent` injects `Timeout`
@@ -105,15 +116,28 @@
 //!   view counts this pair as emitted, and the spec's view always has it.
 //! - A fresh pool per node and trace, rooted at the genesis bank, which stays the root, so the
 //!   pools never prune.
+//! - Repair, for intra-window `SafeToNotar`. A pool hands such a block to the consensus pool
+//!   service, which asks repair for it and emits `SafeToNotar` once the blockstore has the block
+//!   and its parent has a notar-fallback-or-stronger certificate. The driver runs the service's
+//!   own resolution (`resolve_pending_safe_to_notar`) after every vote it delivers to the pool,
+//!   sends no repair request, and looks the parent up in the trace's banks instead of the
+//!   blockstore, as if repair succeeded at once.
 //!
-//! One divergence is avoided by the choice of stakes rather than resolved. When a single vote
-//! takes a block's notarize votes from below 60% to 80% or more, agave's pool forms only the
-//! fast-finalization certificate, and emits `Finalized(block, true)` but no `BlockNotarized`,
-//! while the spec's `blockNotarizedAction` is enabled. With `agave_gen`'s stakes (3, 2, 2, 1) this
-//! happens when v2 and v3 notarize a block before v1, so `agave_pool` uses 3, 2, 2, 2, where no
-//! single vote can do it. In production, bls-sigverify batches votes into aggregates, so such a
-//! jump is common there. The pool view comparison would also catch it, as a
-//! `NotarizationCertificate` only the spec has.
+//! Two divergences are avoided by the choice of stakes rather than resolved:
+//!
+//! - When a single vote takes a block's notarize votes from below 60% to 80% or more, agave's pool
+//!   forms only the fast-finalization certificate, and emits `Finalized(block, true)` but no
+//!   `BlockNotarized`, while the spec's `blockNotarizedAction` is enabled. With `agave_gen`'s
+//!   stakes (3, 2, 2, 1) this happens when v2 and v3 notarize a block before v1, so `agave_pool`
+//!   uses 3, 2, 2, 2, where no single vote can do it. In production, bls-sigverify batches votes
+//!   into aggregates, so such a jump is common there. The pool view comparison would also catch
+//!   it, as a `NotarizationCertificate` only the spec has.
+//! - The spec's `safeToSkipCondition` leaves out the block with the most notarize *voters*, and
+//!   agave's pool the block with the most notarize *stake*, as the paper does. They pick
+//!   different blocks only when the block with the most stake (it then has v1, of stake 3) has
+//!   no more voters than another block. With 3, 2, 2, 2 the stake left over is then at least 4
+//!   on both sides, or 2 for agave and 3 for the spec, so both sides agree on the 40% (3.6 of 9)
+//!   threshold. The spec is not patched for it.
 //!
 //! # Spec patches
 //!
@@ -138,13 +162,17 @@
 //! 11. `isDescendant` walks slots in ascending order, which `quint run`'s Rust backend does not
 //!     guarantee for a fold over a set. Only the `safety` invariant reads it.
 //! 12. The `agave_pool` instance: `agave_gen` without Byzantine processes.
-//! 13. The environment has a pool view: the certificates and parent-ready pairs over all
-//!     messages, recomputed after every step in instances without Byzantine processes. No
-//!     action reads it.
+//! 13. The environment has a pool view: the certificates, the parent-ready pairs, and per
+//!     process the enabled `SafeToNotar` and `SafeToSkip` events, over all messages, recomputed
+//!     after every step in instances without Byzantine processes. No action reads it.
 //! 14. A window start whose earlier slots are all skip-certified is parent-ready for genesis,
 //!     as in agave's `ParentReadyTracker`.
+//! 15. `safeToNotarCondition` only rules out a process that voted to notarize the block itself,
+//!     not another block of the slot, as the paper and agave do.
+//! 16. Outside the first slot of a window, `safeToNotarCondition` also requires a notar-fallback
+//!     certificate on the block's parent, as the paper and agave do.
 //! 17. `safeToSkipCondition` requires that the process sent no skip vote in the slot, as the
-//!     paper and agave do. Numbers 15 and 16 are reserved for later pool patches.
+//!     paper and agave do.
 //! 18. A slot with only skip-fallback votes can be skip-certified for `parentReadyAction`, as
 //!     it already can for `isCertified`.
 //!
@@ -160,7 +188,7 @@ use {
             Banks, GENESIS_HASH, OFFSET, SpecBlock, agave_slot, block_ref, hash_of, spec_hash,
             spec_slot, to_spec_block, to_spec_message,
         },
-        pool::{NodePool, PoolEvent},
+        pool::{AddedVotes, NodePool, PoolEvent},
         spec_types::{LocalState, Message, NetworkMsg, PoolView, SlotObject, SpecState},
     },
     super::{
@@ -180,7 +208,7 @@ use {
     },
     anyhow::{anyhow, bail, ensure},
     quint_connect::{Config, Driver, Path, Result, State, Step, quint_run, switch},
-    solana_runtime::bank::Bank,
+    solana_runtime::{bank::Bank, leader_schedule_utils::leader_slot_index},
     std::{
         any::Any,
         collections::{BTreeMap, BTreeSet},
@@ -203,9 +231,9 @@ trait Instance {
     /// The instance's `numSlots` (agave patch 3): the length of every per-slot list in a
     /// process's `LocalState`.
     const NUM_SLOTS: usize;
-    /// Whether every node runs a consensus pool, from which `BlockNotarized` and `ParentReady`
-    /// are taken instead of from the spec's picks. Only for instances without Byzantine
-    /// processes (see `pool.rs`).
+    /// Whether every node runs a consensus pool, from which `BlockNotarized`, `ParentReady`,
+    /// `SafeToNotar`, and `SafeToSkip` are taken instead of from the spec's picks. Only for
+    /// instances without Byzantine processes (see `pool.rs`).
     const WITH_POOL: bool;
 }
 
@@ -319,6 +347,15 @@ struct ReplayStats {
     pool_dispatched: BTreeMap<&'static str, usize>,
     /// Number of spec actions that asked for a pool event that was already dispatched.
     pool_repeated: BTreeMap<&'static str, usize>,
+    /// Number of `SafeToNotar` events, summed over the pools, that waited for the block's
+    /// parent to be certified (outside the first slot of a window).
+    pending_resolved: usize,
+    /// Number of blocks, summed over the pools, that waited for their parent to be certified and
+    /// were dropped because their slot is not above the highest finalized slot.
+    pending_dropped: usize,
+    /// Number of `SafeToNotar` events, summed over the pools, that the driver added for dropped
+    /// blocks once their parent was certified (see `pool.rs`).
+    stood_in: usize,
 }
 
 impl ReplayStats {
@@ -351,8 +388,25 @@ impl ReplayStats {
         self.current_trace.insert(msg.kind().to_string());
     }
 
-    fn record_pool_emitted(&mut self, event: &PoolEvent) {
-        increment(&mut self.pool_emitted, event.kind());
+    fn record_pool_votes_added(&mut self, added: &AddedVotes) {
+        for event in &added.new_events {
+            increment(&mut self.pool_emitted, event.kind());
+        }
+        self.pending_resolved = self.pending_resolved.saturating_add(added.pending_resolved);
+        self.pending_dropped = self.pending_dropped.saturating_add(added.pending_dropped);
+        self.stood_in = self.stood_in.saturating_add(added.stood_in);
+        if added.stood_in > 0 {
+            self.current_trace
+                .insert("SafeToNotar stood in for".to_string());
+        }
+        if added.pending_resolved > 0 {
+            self.current_trace
+                .insert("pending SafeToNotar resolved".to_string());
+        }
+        if added.pending_dropped > 0 {
+            self.current_trace
+                .insert("pending SafeToNotar dropped".to_string());
+        }
     }
 
     /// Records a spec action that asked for the pool event `event`, which was passed to the event
@@ -362,6 +416,15 @@ impl ReplayStats {
             increment(&mut self.pool_dispatched, event.kind());
             self.current_trace
                 .insert(format!("dispatched {}", event.kind()));
+            // Outside the first slot of a window, the pool emits `SafeToNotar` only once the
+            // block's parent is certified.
+            if let PoolEvent::SafeToNotar(block) = event
+                && leader_slot_index(block.slot) != 0
+            {
+                increment(&mut self.pool_dispatched, "SafeToNotar (intra-window)");
+                self.current_trace
+                    .insert("dispatched SafeToNotar (intra-window)".to_string());
+            }
         } else {
             increment(&mut self.pool_repeated, event.kind());
         }
@@ -570,11 +633,27 @@ impl<I: Instance> VotorMbtDriver<I> {
     }
 
     fn safe_to_notar(&mut self, v: &str, b: SpecBlock) -> Result {
-        self.handle(v, VotorEvent::SafeToNotar(block_ref(b.slot, b.hash)))
+        let block = block_ref(b.slot, b.hash);
+        if !I::WITH_POOL {
+            return self.handle(v, VotorEvent::SafeToNotar(block));
+        }
+        let event = PoolEvent::SafeToNotar(block);
+        if let Some(event) = self.dispatch_pool_event("safeToNotarAction", v, event)? {
+            self.handle(v, event)?;
+        }
+        Ok(())
     }
 
     fn safe_to_skip(&mut self, v: &str, slot: i64) -> Result {
-        self.handle(v, VotorEvent::SafeToSkip(agave_slot(slot)))
+        let slot = agave_slot(slot);
+        if !I::WITH_POOL {
+            return self.handle(v, VotorEvent::SafeToSkip(slot));
+        }
+        let event = PoolEvent::SafeToSkip(slot);
+        if let Some(event) = self.dispatch_pool_event("safeToSkipAction", v, event)? {
+            self.handle(v, event)?;
+        }
+        Ok(())
     }
 
     /// Sends `ParentReady` and checks that it armed the timer for `slot`, which is agave's
@@ -667,9 +746,10 @@ impl<I: Instance> VotorMbtDriver<I> {
                 } else {
                     PoolVote::External(new_vote_aggregate(&self.genesis, (*pushed).clone()))
                 };
-                for event in pool.add_votes(&self.genesis, vec![vote])? {
-                    self.stats.record_pool_emitted(&event);
-                }
+                let added = pool.add_votes(&self.genesis, vec![vote], |block| {
+                    self.banks.parent_of(block)
+                })?;
+                self.stats.record_pool_votes_added(&added);
             }
         }
         Ok(())
@@ -706,20 +786,27 @@ impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
 }
 
 /// Projects the pools onto the spec's pool view, for spec slots `0..I::NUM_SLOTS`. Every pool
-/// receives every vote, so all of them must have the same view, as the spec has a single one.
+/// receives every vote, so all of them must hold the same certificates and parent-ready pairs, as
+/// the spec has a single view of them. `safeToNotar` and `safeToSkip` depend on the node's own
+/// votes, and come from each node's pool.
 fn project_pools<I: Instance>(pools: &BTreeMap<String, NodePool>) -> Result<PoolView> {
-    let mut pools = pools.iter();
-    let (first, pool) = pools
+    let mut iter = pools.iter();
+    let (first, pool) = iter
         .next()
         .ok_or_else(|| anyhow!("no pools in an instance with pools"))?;
-    let view = pool.view(I::NUM_SLOTS)?;
-    for (v, pool) in pools {
+    let mut view = pool.view(I::NUM_SLOTS)?;
+    for (v, pool) in iter {
         let other = pool.view(I::NUM_SLOTS)?;
         ensure!(
             other == view,
             "the pools of {first} and {v} differ, although both received every vote: {first} has \
              {view:?}, {v} has {other:?}"
         );
+    }
+    for (v, pool) in pools {
+        let (safe_to_notar, safe_to_skip) = pool.safe_to_view(I::NUM_SLOTS)?;
+        view.safe_to_notar.insert(v.clone(), safe_to_notar);
+        view.safe_to_skip.insert(v.clone(), safe_to_skip);
     }
     Ok(view)
 }
@@ -777,12 +864,12 @@ fn project_local_state<I: Instance>(
         for &h in &hashes {
             let block = Block {
                 slot: a,
-                block_id: hash_of(h),
+                block_id: hash_of(h).into(),
             };
             if vote_history.is_block_notarized(&block) {
                 objects.insert(SlotObject::BlockNotarized(h));
             }
-            if vote_history.voted_notar_fallback(a, hash_of(h)) {
+            if vote_history.voted_notar_fallback(a, hash_of(h).into()) {
                 objects.insert(SlotObject::VotedNotarFallback(h));
             }
             if parent_ref(h).is_some_and(|parent| vote_history.is_parent_ready(a, &parent)) {
@@ -863,6 +950,9 @@ impl<I: Instance> Drop for VotorMbtDriver<I> {
             pool_emitted,
             pool_dispatched,
             pool_repeated,
+            pending_resolved,
+            pending_dropped,
+            stood_in,
         } = &self.stats;
         let tree_shapes: Vec<String> = TreeShape::ALL
             .iter()
@@ -878,7 +968,9 @@ impl<I: Instance> Drop for VotorMbtDriver<I> {
         let pools = if I::WITH_POOL {
             format!(
                 ", pool events emitted {pool_emitted:?}, dispatched {pool_dispatched:?}, asked \
-                 for again {pool_repeated:?}"
+                 for again {pool_repeated:?}, pending SafeToNotar resolved {pending_resolved} and \
+                 dropped past the highest finalized slot {pending_dropped}, SafeToNotar the \
+                 driver stood in for {stood_in}"
             )
         } else {
             String::new()
@@ -967,7 +1059,7 @@ fn mbt_votor_agave_gen() -> impl Driver {
 /// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
 ///
 /// Like `mbt_votor_agave_gen`, without Byzantine processes, and with a consensus pool per node
-/// that decides which `BlockNotarized` and `ParentReady` events exist (spec patch 12).
+/// that decides which derived events exist (spec patch 12).
 #[ignore]
 #[quint_run(
     spec = "src/event_handler/mbt/spec/statemachine.qnt",

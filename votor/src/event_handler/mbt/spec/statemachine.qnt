@@ -5,10 +5,13 @@ module consensus {
 
   /// agave patch 13: what a pool that holds every message knows: the certificates that
   /// `isCertified` holds for, and the pairs `(s, hash(b))` for which `ParentReady(s, hash(b))`
-  /// is enabled.
+  /// is enabled. Also, per benevolent process, the blocks and slots for which `SafeToNotar` and
+  /// `SafeToSkip` are enabled; unlike the rest, these depend on the process's own votes.
   type PoolView = {
     certificates: Set[Certificate],
     parentReady: Set[(Slot, Blockhash)],
+    safeToNotar: ProcessID -> Set[BlockReference],
+    safeToSkip: ProcessID -> Set[Slot],
   }
 
   /// This is all the information of the global state
@@ -103,6 +106,7 @@ module consensus {
       NotarizationCertificate(r),
       NotarFallbackCertificate(r),
     ).filter(c => isCertified(c, msgsBySlot.get(r.slot)))).flatten()
+    val parentCertified = blocks.mapBy(b => parentNotarFallbackCertified(b, msgs, blocks))
     val slotCertificates = aliveSlots.map(slot => Set(
       SkipCertificate(slot),
       FinalizationCertificate(slot),
@@ -112,6 +116,14 @@ module consensus {
       parentReady: Set((0, -1)).union(aliveSlots.map(slot =>
         parentReadyBlocks(slot, msgs, blocks).map(b => (slot, b.hash))
       ).flatten()),
+      safeToNotar: benevolent.mapBy(v =>
+        blocks.filter(b =>
+          safeToNotarHolds(v, b, msgsBySlot.get(b.slot), parentCertified.get(b))
+        ).map(b => b.reference())
+      ),
+      safeToSkip: benevolent.mapBy(v =>
+        aliveSlots.filter(slot => safeToSkipHolds(v, slot, msgsBySlot.get(slot)))
+      ),
     }
   }
 
@@ -128,7 +140,7 @@ module consensus {
   action initWith(blocks: Set[Block]): bool = all {
     s' = withPoolView({
       blocks: blocks,
-      pool: { certificates: Set(), parentReady: Set() },
+      pool: { certificates: Set(), parentReady: Set(), safeToNotar: Map(), safeToSkip: Map() },
       system: benevolent.mapBy(_ => {
         // preload state for `numSlots` slots (agave patch 3)
         state: range(0, numSlots).listMap(i => if (i == 0) Set(ParentReady(-1)) else Set()),
@@ -330,11 +342,21 @@ module consensus {
   def safeToNotarCondition(v: ProcessID, now: Slot, b: Block): bool = all {
     // Consider block b in slot s = slot(b).
     b.slot == now,
+    safeToNotarHolds(v, b, allMessages, parentNotarFallbackCertified(b, allMessages, s.blocks)),
+  }
 
-    val voted = allMessages.filter(m => m.sender == v and now == slotOf(m.msg))
+  /// agave patch 13: the body of `safeToNotarCondition` over the messages `msgs` (upstream: over
+  /// `allMessages`, inline), so that `poolView` can evaluate it. Only the messages of `b`'s slot
+  /// matter. `parentCertified` is `parentNotarFallbackCertified(b, ...)` (agave patch 16).
+  pure def safeToNotarHolds(v: ProcessID, b: Block, msgs: Set[NetworkMsg], parentCertified: bool): bool = all {
+    val now = b.slot
+    val voted = msgs.filter(m => m.sender == v and now == slotOf(m.msg))
+    // agave patch 15: only a notarization vote for `b` itself rules the event out, as the comment
+    // above, the paper, and agave say (upstream: any `NotarVoteMsg` in the slot, so a process that
+    // voted to notarize another block of the slot never voted to notar-fallback `b`).
     val notarVoted =
       voted.filter(m => match m.msg {
-        | NotarVoteMsg(m) => true
+        | NotarVoteMsg(r) => r == b.reference()
         | _ => false
       })
 
@@ -342,8 +364,8 @@ module consensus {
       voted.size() > 0,
       notarVoted.size() == 0,
     },
-    val notar = votedToNotar(b.reference(), allMessages)
-    val skip = votedToSkip(now, allMessages)
+    val notar = votedToNotar(b.reference(), msgs)
+    val skip = votedToSkip(b.slot, msgs)
     // notar(b) ≥ 40% or (skip(s) + notar(b) ≥ 60% and notar(b) ≥ 20%).
     // The paper postulates that the pool stores for each sender and slot a skip or a notar message
     // but not both. Thus, in the paper they can sum up the sizes of the sets. In this spec we
@@ -355,8 +377,21 @@ module consensus {
         surpassesThreshold(skip.union(notar), 60),
         surpassesThreshold(notar, 20)
       }
-    }
+    },
+    // agave patch 16: outside the first slot of a leader window, the event also waits for a
+    // notar-fallback certificate on the parent of `b` (upstream: the parent is ignored). The
+    // paper's Definition 16 retrieves `b` through repair to learn its parent, and emits the event
+    // once Pool also holds the parent's notar-fallback certificate; agave does the same.
+    firstSlotInLeaderWindow(b.slot) or parentCertified,
   }
+
+  /// agave patch 16: whether the parent of `b` has a notar-fallback certificate over `msgs`,
+  /// which a notarization or fast-finalization certificate implies. The genesis parent (hash -1)
+  /// counts as certified, as `init`'s `ParentReady(-1)` and patch 14 assume. A parent that is not
+  /// one of the `blocks` has no certificate, since no correct process votes for it.
+  pure def parentNotarFallbackCertified(b: Block, msgs: Set[NetworkMsg], blocks: Set[Block]): bool =
+    b.parent == -1 or blocks.exists(p =>
+      p.hash == b.parent and isCertified(NotarFallbackCertificate(p.reference()), msgs))
 
   // Emit SafeToNotar and process it
   action safeToNotarAction(v: ProcessID, now: Slot): bool =
@@ -369,18 +404,22 @@ module consensus {
 
   // • SafeToSkip(s): The event is only issued if the node voted in slot s already,
   // but not to skip s.
-  def safeToSkipCondition(v: ProcessID, now: Slot): bool = all {
+  def safeToSkipCondition(v: ProcessID, now: Slot): bool = safeToSkipHolds(v, now, allMessages)
+
+  /// agave patch 13: the body of `safeToSkipCondition` over the messages `msgs` (upstream: over
+  /// `allMessages`, inline), so that `poolView` can evaluate it.
+  pure def safeToSkipHolds(v: ProcessID, now: Slot, msgs: Set[NetworkMsg]): bool = all {
     // node voted in slot s already, but not to skip s.
     // agave patch 17: `v` sent some message for `now`, and no `SkipVoteMsg(now)` (upstream: some
     // message for `now` other than `SkipVoteMsg(now)`, which also holds after `v` voted to skip
     // `now` and then cast a notar-fallback vote in it).
-    allMessages.exists(m => m.sender == v and slotOf(m.msg) == now),
-    not(allMessages.exists(m => m.sender == v and m.msg == SkipVoteMsg(now))),
+    msgs.exists(m => m.sender == v and slotOf(m.msg) == now),
+    not(msgs.exists(m => m.sender == v and m.msg == SkipVoteMsg(now))),
 
     // Moreover:
     // skip(s) + Σ_b notar(b) − max_b notar(b) ≥ 40%.
     val blocksWithNotarVotes =
-      allMessages
+      msgs
         .filter(m => slotOf(m.msg) == now)
         .fold(Set(), (s, m) => match m.msg {
           | NotarVoteMsg(n) => s.setAdd(n)
@@ -389,12 +428,12 @@ module consensus {
 
     // Σ_b notar(b)
     val allNotarVotes = blocksWithNotarVotes.map(b =>
-      votedToNotar(b, allMessages)
+      votedToNotar(b, msgs)
     ).flatten()
 
     // max_b
     val blockWithMostVotes = blocksWithNotarVotes.fold({ slot: -1, hash: -1 }, (res, x) => {
-      if (votedToNotar(x, allMessages).size() > votedToNotar(res, allMessages).size())
+      if (votedToNotar(x, msgs).size() > votedToNotar(res, msgs).size())
         x
       else
         res
@@ -405,11 +444,11 @@ module consensus {
     // same for (-)
 
     // skip(s)
-    votedToSkip(now, allMessages)
+    votedToSkip(now, msgs)
       // + Σ_b notar(b)
       .union(allNotarVotes)
       // - max_b notar(b)
-      .exclude(votedToNotar(blockWithMostVotes, allMessages))
+      .exclude(votedToNotar(blockWithMostVotes, msgs))
       // ≥ 40%.
       .surpassesThreshold(40)
   }

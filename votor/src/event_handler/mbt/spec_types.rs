@@ -67,6 +67,12 @@ pub(super) struct PoolView {
     /// `(0, -1)`.
     #[serde(rename = "parentReady")]
     pub(super) parent_ready: BTreeSet<(i64, i64)>,
+    /// For every benevolent process, the blocks for which `SafeToNotar` holds.
+    #[serde(rename = "safeToNotar")]
+    pub(super) safe_to_notar: BTreeMap<String, BTreeSet<BlockRef>>,
+    /// For every benevolent process, the slots for which `SafeToSkip` holds.
+    #[serde(rename = "safeToSkip")]
+    pub(super) safe_to_skip: BTreeMap<String, BTreeSet<i64>>,
 }
 
 /// Mirror of the spec's `NetworkMsg`.
@@ -143,6 +149,18 @@ impl PartialEq for SpecState {
                     &spec.parent_ready,
                     &agave.parent_ready,
                 );
+                map_diff(
+                    &mut out,
+                    "pool.safeToNotar",
+                    &spec.safe_to_notar,
+                    &agave.safe_to_notar,
+                );
+                map_diff(
+                    &mut out,
+                    "pool.safeToSkip",
+                    &spec.safe_to_skip,
+                    &agave.safe_to_skip,
+                );
             }
             system_diff(&mut out, &self.system, &other.system);
             eprint!("{out}");
@@ -191,6 +209,23 @@ fn system_diff(
                 );
             }
         }
+    }
+}
+
+/// Describes, per process, the elements that are only in the spec's set or only in agave's.
+fn map_diff<T: Ord + Debug>(
+    out: &mut String,
+    name: &str,
+    spec: &BTreeMap<String, BTreeSet<T>>,
+    agave: &BTreeMap<String, BTreeSet<T>>,
+) {
+    let processes: BTreeSet<&String> = spec.keys().chain(agave.keys()).collect();
+    for v in processes {
+        let (Some(spec), Some(agave)) = (spec.get(v), agave.get(v)) else {
+            let _ = writeln!(out, "  {name}: process {v} is missing on one side");
+            continue;
+        };
+        set_diff(out, &format!("{name}[{v}]"), spec, agave);
     }
 }
 
