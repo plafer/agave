@@ -28,6 +28,7 @@ use {
         io::BufReader,
         path::PathBuf,
         process::Command,
+        thread,
         time::{Duration, Instant},
     },
     tempfile::TempDir,
@@ -177,9 +178,11 @@ fn value_at(state: Record, path: &[&str]) -> Result<Value> {
     Ok(value)
 }
 
-/// For each target, generates its witnesses with `quint run --invariant`, and replays them all
-/// with one driver. Fails if a target has no witness at all; fewer witnesses than asked for are
-/// only reported, because with a random seed and a low hit rate that happens by chance.
+/// For each target, generates its witnesses with `quint run --invariant`, one `quint` process per
+/// target at the same time, and then replays them all with one driver, target by target. Fails
+/// if a target has no witness at all; fewer witnesses than asked for are only reported, because
+/// with a random seed and a low hit rate that happens by chance. After each target, prints the
+/// driver's counters over that target's witnesses.
 ///
 /// The seed comes from `QUINT_SEED`, or is random, as in the simulation tests. A failure names
 /// the target, the witness, the step, and the seed.
@@ -191,13 +194,42 @@ pub(super) fn run_targets<I: Instance>(targets: &[Target]) -> Result {
 }
 
 fn run_targets_with_seed<I: Instance>(targets: &[Target], seed: &str) -> Result {
+    // `quint run` uses one core, so every target gets its own `quint` process, all at once.
+    let start = Instant::now();
+    let generated: Vec<(Result<Vec<Trace<Value>>>, Duration)> = thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|target| {
+                scope.spawn(move || {
+                    let start = Instant::now();
+                    (witnesses::<I>(target, seed), start.elapsed())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    (
+                        Err(anyhow!("generating the witnesses panicked")),
+                        Duration::ZERO,
+                    )
+                })
+            })
+            .collect()
+    });
+    eprintln!(
+        "votor MBT targets of {}: generated the witnesses of {} targets in {}",
+        I::MAIN,
+        targets.len(),
+        seconds(start.elapsed()),
+    );
+
     let mut driver = VotorMbtDriver::<I>::new();
-    for target in targets {
-        let start = Instant::now();
-        let witnesses = witnesses::<I>(target, seed).with_context(|| {
+    for (target, (witnesses, quint_time)) in targets.iter().zip(generated) {
+        let witnesses = witnesses.with_context(|| {
             format!("cannot generate the witnesses of target '{}'", target.name)
         })?;
-        let quint_time = start.elapsed();
         ensure!(
             !witnesses.is_empty(),
             "no trace reached '{}' ({}) in {} samples of {} steps",
@@ -209,6 +241,8 @@ fn run_targets_with_seed<I: Instance>(targets: &[Target], seed: &str) -> Result 
 
         let start = Instant::now();
         let found = witnesses.len();
+        let mut lengths: Vec<usize> = witnesses.iter().map(|trace| trace.states.len()).collect();
+        lengths.sort_unstable();
         for (index, trace) in witnesses.into_iter().enumerate() {
             replay_trace(&mut driver, trace).with_context(|| {
                 format!(
@@ -217,16 +251,23 @@ fn run_targets_with_seed<I: Instance>(targets: &[Target], seed: &str) -> Result 
                 )
             })?;
         }
+        let replay_time = start.elapsed();
+        // What this target's witnesses, and only they, drove agave through.
+        let stats = driver.take_stats();
         eprintln!(
             "votor MBT target '{}' ({}) of {}: {found}/{} witnesses in at most {} samples, quint \
-             {}, replay {}",
+             {}, replay {}, states per witness min/median/max {}/{}/{}\n{}",
             target.name,
             target.invariant,
             I::MAIN,
             target.witnesses,
             target.max_samples,
             seconds(quint_time),
-            seconds(start.elapsed()),
+            seconds(replay_time),
+            lengths.first().copied().unwrap_or_default(),
+            lengths.get(lengths.len() / 2).copied().unwrap_or_default(),
+            lengths.last().copied().unwrap_or_default(),
+            stats.summary(I::WITH_POOL),
         );
     }
     Ok(())

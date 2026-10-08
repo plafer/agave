@@ -416,6 +416,27 @@ skip-fallback votes certify slot 0. The patch also collects the slots of
 changes `parentReadyAction`, in every instance with a second window. The bug
 is upstream too, and is to be reported upstream.
 
+### Patch 19: witnesses of the targeted scenarios
+
+`statemachine.qnt` (`parentReadySlot4AfterSkip`, `notarFallbackForOtherBlock`,
+`finalizedAfterSkipVote`, `blockFastFinalized`,
+`intraWindowNotarFallbackVoted`, `parentReadyGenesisSlot4`,
+`skipCertifiedByFallbackOnly`).
+
+Not a fix, and not to be reported upstream. The targets tests
+(`mbt_votor_agave_gen_targets` and `mbt_votor_agave_pool_targets`) replay
+only traces that reach a scenario: each target is `not(<witness>)`, passed to
+`quint run --invariant`, so every trace that violates it reaches the scenario
+and ends at the first state where it does. The patch adds one witness `val`
+per scenario, next to patch 9's witnesses, two of which
+(`notarizedInWindow1` and `skipFallbackVoted`) are targets too. See the
+target catalogue below.
+
+Like patch 9's witnesses, the vals are observations: no action reads them.
+With and without the patch, `quint run --mbt` produces the same traces, apart
+from the creation time in `#meta`, for 50 traces of each of the five
+instances at seeds `0x1234` and `0x4321`.
+
 ### Not patched: `safeToSkipCondition` excludes the block with the most voters
 
 `safeToSkipCondition` computes `skip(s) + Σ notar(b) − max notar(b)` over
@@ -438,3 +459,302 @@ have parents 42 and 43 in the first window. Slot 4 can become parent-ready
 for 42, 43, or the Byzantine 46; all three occur in generated traces. v1 (stake 3) and b1 (stake 1)
 together reach the 60% certificate threshold, so v1 notarizing 42 and timing
 out a later slot of window 0 is enough to make slot 4 parent-ready.
+
+## Target catalogue
+
+The scenarios below are reached by only a share of random traces. Each was
+measured first with `quint run --witnesses` over 200 traces of 60 steps
+(`--init=initGenerated`, seeds `0x1234` and `0x4321`). A scenario reached by
+at least about 1% of traces became a target, with `witnesses` sized so that
+`quint run --invariant` takes about 10 s or less on its own. Two scenarios
+reached by fewer traces (one of them only in `agave_pool`), and two that are
+not a property of a single state, were left out.
+
+`notarizedInWindow1` (Phase 10's target) keeps its 50 witnesses. It is also a
+target in `agave_pool`, where 9 to 10% of traces reach it, which the candidate
+list did not plan.
+
+### Targets
+
+Hit rate: share of 200 traces at seed `0x1234` / `0x4321`. Quint time: one
+`quint run --invariant` on its own, at seed `0x1234`. In the tests, every
+target's `quint` runs at the same time as the others (and as the simulation
+tests), so the times the tests print are longer.
+
+| Scenario | Instance | Witness | Hit rate | Witnesses (max samples) | Quint time |
+|---|---|---|---|---|---|
+| A block notarized in window 1 | `agave_gen` | `notarizedInWindow1` | 14.5% / 18% | 50 (1000) | 13.1 s |
+| `ParentReady` for slot 4 with a skipped slot in window 0 | `agave_gen` | `parentReadySlot4AfterSkip` | 91% / 93.5% | 20 (100) | 1.8 s |
+| A notar-fallback vote for a block other than the process's notarize vote | `agave_gen` | `notarFallbackForOtherBlock` | 14% / 11% | 12 (500) | 8.6 s |
+| A skip-fallback vote (always after the process's notarize vote, by patch 17) | `agave_gen` | `skipFallbackVoted` | 19.5% / 18% | 25 (500) | 7.3 s |
+| A slot finalized in a window where an earlier slot got a skip vote | `agave_gen` | `finalizedAfterSkipVote` | 8% / 8% | 10 (600) | 8.5 s |
+| A block notarized in window 1 | `agave_pool` | `notarizedInWindow1` | 9% / 10% | 20 (600) | 9.5 s |
+| `ParentReady` for slot 4 with a skipped slot in window 0 | `agave_pool` | `parentReadySlot4AfterSkip` | 73.5% / 75% | 20 (100) | 2.0 s |
+| A notar-fallback vote for a block other than the process's notarize vote | `agave_pool` | `notarFallbackForOtherBlock` | 9% / 8% | 20 (600) | 8.3 s |
+| A skip-fallback vote | `agave_pool` | `skipFallbackVoted` | 33% / 29.5% | 25 (300) | 3.3 s |
+| Fast finalization | `agave_pool` | `blockFastFinalized` | 30% / 35.5% | 25 (300) | 3.9 s |
+| An intra-window `SafeToNotar`, resolved through the pending path | `agave_pool` | `intraWindowNotarFallbackVoted` | 24.5% / 31.5% | 25 (300) | 5.0 s |
+| `ParentReady` for genesis at slot 4 (patch 14) | `agave_pool` | `parentReadyGenesisSlot4` | 22.5% / 19.5% | 25 (300) | 4.2 s |
+
+Notes:
+
+- "A slot finalized in a window where an earlier slot was skipped" is read
+  across processes: some process voted to skip an earlier slot of the
+  finalized slot's window. A single process cannot do both, because its
+  notarize votes in a window form a prefix that starts at the window's first
+  slot, and a skip vote skips every slot of the window it has not voted in.
+  The single-process reading (a process voted to finalize a slot, and has
+  `BadWindow` on an earlier slot of the window, from a fallback vote) was
+  reached in 0 of 800 traces (both instances, both seeds), and the reading
+  over skip certificates in 0 of 400 traces of `agave_gen`.
+- "Fast finalization" was planned as `FinalizeFast` without `Notarize`
+  (Phase 7's deviation 1). With `agave_pool`'s stakes, no single vote can
+  form `FinalizeFast` first (patch 12), so the target is any fast
+  finalization. The coverage below shows `certificate FinalizeFast` and
+  `certificate Notarize` in every witness.
+- Every intra-window `SafeToNotar` in agave goes through the consensus pool
+  service's pending path, so "resolved through the pending path" holds for
+  every witness of `intraWindowNotarFallbackVoted`. The target stops at the
+  notar-fallback vote, so the event was also dispatched.
+
+### Left out
+
+| Scenario | Instance | Hit rate | Why it is left out |
+|---|---|---|---|
+| Two blocks pending in one slot, and the earlier one is voted once its parent is (patch 1's order) | both | not a witness; measured offline: 0.5% / 1% (`agave_gen`), 2.5% / 2% (`agave_pool`) | Not a property of a single state. When a process votes, `tryNotar` clears the slot's pending blocks, so the state no longer shows that the voted block was pending, nor in which order. A witness of the precondition alone (two blocks pending in one slot, 95% to 99.5% of traces) ends before the vote. Needs a recorded history in the spec, or a search backend. The offline rate counts traces in which a process votes, out of its pending blocks, for the earlier of two pending blocks that have the same parent, computed from the ITF states of 200 traces. Agave's pending blocks are compared in arrival order after every step, so the simulation tests still check this order where it occurs. |
+| A block voted out of `pendingBlocks` after its parent's slot was voted (the pending path of `try_notar`) | both | not a witness; measured offline: 37% / 30.5% (`agave_gen`), 38% / 39.5% (`agave_pool`) | Not a property of a single state, for the same reason. The simulation tests reach it in about a third of their traces. |
+| A slot finalized in a window where an earlier slot got a skip vote | `agave_pool` | 0.5% / 1% | Too rare: needs a biased `init`/`step` or a search backend. Kept for `agave_gen`. |
+| A skip certificate made of skip-fallback votes only (patch 18) | `agave_pool` | 0.5% / 0% (`skipCertifiedByFallbackOnly`) | Too rare: needs a biased `init`/`step` or a search backend. The stronger scenario, where such a slot makes a window start parent-ready (the one patch 18 changes), was reached in 1 and 0 of 200 traces. In `agave_gen`, 0 / 0. |
+
+### Coverage
+
+What each target's witnesses drove agave through, as the targets tests print
+it (`QUINT_SEED=0x1234 cargo nextest run -p agave-votor --features
+agave-unstable-api --run-ignored ignored-only --no-capture targets`). Every
+witness of a target reaches its scenario, and the counter for the agave path
+the target is named after is non-zero in each block: `blockNotarizedAction`
+for window 1, `parentReadyAction`, `NotarFallBackVoteMsg` and
+`safeToNotarAction`, `SkipFallbackVoteMsg` and `safeToSkipAction`,
+`FinalVoteMsg`, `certificate FinalizeFast`, `pending SafeToNotar resolved`
+and `intra-window SafeToNotar dispatched`, and `dispatched ParentReady`.
+
+```text
+votor MBT target 'notarized in window 1' (not(notarizedInWindow1)) of agave_gen: 50/50 witnesses in
+    at most 1000 samples, quint 15.7 s, replay 1.3 s, states per witness min/median/max 14/35/60
+  traces 50, actions {"blockNotarizedAction": 141, "fireTimeoutEvent": 311, "initGenerated": 50,
+      "parentReadyAction": 192, "receiveBlock": 1069, "safeToNotarAction": 38, "safeToSkipAction":
+      10}, votes pushed 1076
+  traces whose block tree has: Equivocation 44 (88%), PhantomParent 16 (32%), FarParent 46 (92%),
+      LateGenesisParent 35 (70%), EmptySlot 38 (76%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 38 (76%),
+      NotarFallBackVoteMsg 19 (38%), NotarVoteMsg 50 (100%), SkipFallbackVoteMsg 8 (16%),
+      SkipVoteMsg 50 (100%), blockNotarizedAction 50 (100%), fireTimeoutEvent 50 (100%),
+      initGenerated 50 (100%), parentReadyAction 50 (100%), receiveBlock 50 (100%),
+      safeToNotarAction 19 (38%), safeToSkipAction 8 (16%)
+
+votor MBT target 'ParentReady for slot 4 after a skipped slot' (not(parentReadySlot4AfterSkip)) of
+    agave_gen: 20/20 witnesses in at most 100 samples, quint 2.9 s, replay 0.3 s, states per witness
+    min/median/max 6/23/53
+  traces 20, actions {"blockNotarizedAction": 29, "fireTimeoutEvent": 58, "initGenerated": 20,
+      "parentReadyAction": 22, "receiveBlock": 375, "safeToNotarAction": 3}, votes pushed 227
+  traces whose block tree has: Equivocation 17 (85%), PhantomParent 13 (65%), FarParent 20 (100%),
+      LateGenesisParent 13 (65%), EmptySlot 12 (60%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 10 (50%),
+      NotarFallBackVoteMsg 3 (15%), NotarVoteMsg 17 (85%), SkipVoteMsg 20 (100%),
+      blockNotarizedAction 11 (55%), fireTimeoutEvent 20 (100%), initGenerated 20 (100%),
+      parentReadyAction 20 (100%), receiveBlock 20 (100%), safeToNotarAction 3 (15%)
+
+votor MBT target 'notar-fallback vote for a block other than the own notarize vote'
+    (not(notarFallbackForOtherBlock)) of agave_gen: 12/12 witnesses in at most 500 samples, quint
+    10.1 s, replay 0.2 s, states per witness min/median/max 7/36/52
+  traces 12, actions {"blockNotarizedAction": 21, "fireTimeoutEvent": 42, "initGenerated": 12,
+      "parentReadyAction": 36, "receiveBlock": 237, "safeToNotarAction": 17, "safeToSkipAction": 2},
+      votes pushed 191
+  traces whose block tree has: Equivocation 12 (100%), PhantomParent 7 (58%), FarParent 10 (83%),
+      LateGenesisParent 9 (75%), EmptySlot 5 (41%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 6 (50%),
+      NotarFallBackVoteMsg 12 (100%), NotarVoteMsg 12 (100%), SkipFallbackVoteMsg 2 (16%),
+      SkipVoteMsg 12 (100%), blockNotarizedAction 8 (66%), fireTimeoutEvent 11 (91%), initGenerated
+      12 (100%), parentReadyAction 9 (75%), receiveBlock 12 (100%), safeToNotarAction 12 (100%),
+      safeToSkipAction 2 (16%)
+
+votor MBT target 'skip-fallback vote' (not(skipFallbackVoted)) of agave_gen: 25/25 witnesses in at
+    most 500 samples, quint 9.1 s, replay 0.5 s, states per witness min/median/max 13/37/60
+  traces 25, actions {"blockNotarizedAction": 30, "fireTimeoutEvent": 130, "initGenerated": 25,
+      "parentReadyAction": 143, "receiveBlock": 577, "safeToNotarAction": 43, "safeToSkipAction":
+      25}, votes pushed 484
+  traces whose block tree has: Equivocation 22 (88%), PhantomParent 10 (40%), FarParent 22 (88%),
+      LateGenesisParent 17 (68%), EmptySlot 12 (48%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 11 (44%),
+      NotarFallBackVoteMsg 14 (56%), NotarVoteMsg 25 (100%), SkipFallbackVoteMsg 25 (100%),
+      SkipVoteMsg 25 (100%), blockNotarizedAction 13 (52%), fireTimeoutEvent 25 (100%),
+      initGenerated 25 (100%), parentReadyAction 23 (92%), receiveBlock 25 (100%), safeToNotarAction
+      14 (56%), safeToSkipAction 25 (100%)
+
+votor MBT target 'slot finalized after a skip vote earlier in its window'
+    (not(finalizedAfterSkipVote)) of agave_gen: 10/10 witnesses in at most 600 samples, quint 9.7 s,
+    replay 0.2 s, states per witness min/median/max 22/54/61
+  traces 10, actions {"blockNotarizedAction": 63, "fireTimeoutEvent": 43, "initGenerated": 10,
+      "parentReadyAction": 57, "receiveBlock": 289, "safeToNotarAction": 12, "safeToSkipAction": 1},
+      votes pushed 204
+  traces whose block tree has: Equivocation 8 (80%), PhantomParent 3 (30%), FarParent 10 (100%),
+      LateGenesisParent 5 (50%), EmptySlot 8 (80%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 10 (100%),
+      NotarFallBackVoteMsg 6 (60%), NotarVoteMsg 10 (100%), SkipFallbackVoteMsg 1 (10%), SkipVoteMsg
+      10 (100%), blockNotarizedAction 10 (100%), fireTimeoutEvent 10 (100%), initGenerated 10
+      (100%), parentReadyAction 9 (90%), receiveBlock 10 (100%), safeToNotarAction 6 (60%),
+      safeToSkipAction 1 (10%)
+
+votor MBT target 'notarized in window 1' (not(notarizedInWindow1)) of agave_pool: 20/20 witnesses in
+    at most 600 samples, quint 12.9 s, replay 0.8 s, states per witness min/median/max 28/45/61
+  traces 20, actions {"blockNotarizedAction": 44, "fireTimeoutEvent": 133, "initGenerated": 20,
+      "parentReadyAction": 84, "receiveBlock": 578, "safeToNotarAction": 14, "safeToSkipAction":
+      16}, votes pushed 546
+  traces whose block tree has: Equivocation 15 (75%), PhantomParent 8 (40%), FarParent 17 (85%),
+      LateGenesisParent 14 (70%), EmptySlot 15 (75%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 14 (70%),
+      NotarFallBackVoteMsg 11 (55%), NotarVoteMsg 20 (100%), SkipFallbackVoteMsg 8 (40%),
+      SkipVoteMsg 20 (100%), blockNotarizedAction 20 (100%), certificate Finalize 3 (15%),
+      certificate FinalizeFast 8 (40%), certificate Notarize 20 (100%), certificate NotarizeFallback
+      9 (45%), certificate Skip 20 (100%), dispatched BlockNotarized 20 (100%), dispatched
+      ParentReady 20 (100%), dispatched SafeToNotar 11 (55%), dispatched SafeToNotar (intra-window)
+      2 (10%), dispatched SafeToSkip 8 (40%), fireTimeoutEvent 20 (100%), initGenerated 20 (100%),
+      parentReadyAction 20 (100%), pending SafeToNotar resolved 8 (40%), receiveBlock 20 (100%),
+      safeToNotarAction 11 (55%), safeToSkipAction 8 (40%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 36/0/0, BlockNotarized
+      152/36/8, Finalized(fast) 36/0/0, Finalized(slow) 12/0/0, ParentReady 92/73/11, SafeToNotar
+      47/11/3, SafeToSkip 40/14/2
+  pending SafeToNotar: resolved 21, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 2
+
+votor MBT target 'ParentReady for slot 4 after a skipped slot' (not(parentReadySlot4AfterSkip)) of
+    agave_pool: 20/20 witnesses in at most 100 samples, quint 4.3 s, replay 0.5 s, states per
+    witness min/median/max 8/29/59
+  traces 20, actions {"blockNotarizedAction": 27, "fireTimeoutEvent": 77, "initGenerated": 20,
+      "parentReadyAction": 20, "receiveBlock": 453, "safeToNotarAction": 7, "safeToSkipAction": 9},
+      votes pushed 329
+  traces whose block tree has: Equivocation 18 (90%), PhantomParent 10 (50%), FarParent 18 (90%),
+      LateGenesisParent 15 (75%), EmptySlot 12 (60%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 9 (45%),
+      NotarFallBackVoteMsg 4 (20%), NotarVoteMsg 18 (90%), SkipFallbackVoteMsg 6 (30%), SkipVoteMsg
+      20 (100%), blockNotarizedAction 9 (45%), certificate Finalize 1 (5%), certificate FinalizeFast
+      5 (25%), certificate Notarize 12 (60%), certificate NotarizeFallback 3 (15%), certificate Skip
+      20 (100%), dispatched BlockNotarized 9 (45%), dispatched ParentReady 20 (100%), dispatched
+      SafeToNotar 4 (20%), dispatched SafeToNotar (intra-window) 2 (10%), dispatched SafeToSkip 6
+      (30%), fireTimeoutEvent 20 (100%), initGenerated 20 (100%), parentReadyAction 20 (100%),
+      pending SafeToNotar resolved 6 (30%), receiveBlock 20 (100%), safeToNotarAction 4 (20%),
+      safeToSkipAction 6 (30%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 16/0/0, BlockNotarized 68/21/6,
+      Finalized(fast) 24/0/0, Finalized(slow) 4/0/0, ParentReady 80/20/0, SafeToNotar 39/7/0,
+      SafeToSkip 29/9/0
+  pending SafeToNotar: resolved 17, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 4
+
+votor MBT target 'notar-fallback vote for a block other than the own notarize vote'
+    (not(notarFallbackForOtherBlock)) of agave_pool: 20/20 witnesses in at most 600 samples, quint
+    11.6 s, replay 0.5 s, states per witness min/median/max 8/41/60
+  traces 20, actions {"blockNotarizedAction": 27, "fireTimeoutEvent": 73, "initGenerated": 20,
+      "parentReadyAction": 22, "receiveBlock": 556, "safeToNotarAction": 27, "safeToSkipAction": 8},
+      votes pushed 351
+  traces whose block tree has: Equivocation 20 (100%), PhantomParent 9 (45%), FarParent 19 (95%),
+      LateGenesisParent 14 (70%), EmptySlot 12 (60%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 7 (35%),
+      NotarFallBackVoteMsg 20 (100%), NotarVoteMsg 20 (100%), SkipFallbackVoteMsg 7 (35%),
+      SkipVoteMsg 20 (100%), blockNotarizedAction 8 (40%), certificate Finalize 2 (10%), certificate
+      FinalizeFast 2 (10%), certificate Notarize 10 (50%), certificate NotarizeFallback 16 (80%),
+      certificate Skip 12 (60%), dispatched BlockNotarized 8 (40%), dispatched ParentReady 4 (20%),
+      dispatched SafeToNotar 20 (100%), dispatched SafeToNotar (intra-window) 6 (30%), dispatched
+      SafeToSkip 7 (35%), fireTimeoutEvent 18 (90%), initGenerated 20 (100%), parentReadyAction 4
+      (20%), pending SafeToNotar resolved 8 (40%), receiveBlock 20 (100%), safeToNotarAction 20
+      (100%), safeToSkipAction 7 (35%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 68/0/0, BlockNotarized 76/26/1,
+      Finalized(fast) 12/0/0, Finalized(slow) 8/0/0, ParentReady 60/13/9, SafeToNotar 72/25/2,
+      SafeToSkip 59/8/0
+  pending SafeToNotar: resolved 32, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 9
+
+votor MBT target 'skip-fallback vote' (not(skipFallbackVoted)) of agave_pool: 25/25 witnesses in at
+    most 300 samples, quint 6.5 s, replay 0.6 s, states per witness min/median/max 10/34/59
+  traces 25, actions {"blockNotarizedAction": 32, "fireTimeoutEvent": 83, "initGenerated": 25,
+      "parentReadyAction": 12, "receiveBlock": 672, "safeToNotarAction": 21, "safeToSkipAction":
+      25}, votes pushed 458
+  traces whose block tree has: Equivocation 24 (96%), PhantomParent 13 (52%), FarParent 23 (92%),
+      LateGenesisParent 15 (60%), EmptySlot 9 (36%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 8 (32%),
+      NotarFallBackVoteMsg 10 (40%), NotarVoteMsg 25 (100%), SkipFallbackVoteMsg 25 (100%),
+      SkipVoteMsg 25 (100%), blockNotarizedAction 8 (32%), certificate Finalize 3 (12%), certificate
+      FinalizeFast 3 (12%), certificate Notarize 12 (48%), certificate NotarizeFallback 9 (36%),
+      certificate Skip 21 (84%), dispatched BlockNotarized 8 (32%), dispatched ParentReady 4 (16%),
+      dispatched SafeToNotar 10 (40%), dispatched SafeToNotar (intra-window) 4 (16%), dispatched
+      SafeToSkip 25 (100%), fireTimeoutEvent 22 (88%), initGenerated 25 (100%), parentReadyAction 4
+      (16%), pending SafeToNotar resolved 15 (60%), receiveBlock 25 (100%), safeToNotarAction 10
+      (40%), safeToSkipAction 25 (100%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 48/0/0, BlockNotarized
+      56/22/10, Finalized(fast) 16/0/0, Finalized(slow) 12/0/0, ParentReady 52/10/2, SafeToNotar
+      93/16/5, SafeToSkip 106/25/0
+  pending SafeToNotar: resolved 42, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 7
+
+votor MBT target 'fast finalization' (not(blockFastFinalized)) of agave_pool: 25/25 witnesses in at
+    most 300 samples, quint 6.8 s, replay 0.4 s, states per witness min/median/max 7/18/51
+  traces 25, actions {"blockNotarizedAction": 27, "fireTimeoutEvent": 35, "initGenerated": 25,
+      "parentReadyAction": 10, "receiveBlock": 419, "safeToNotarAction": 4, "safeToSkipAction": 5},
+      votes pushed 246
+  traces whose block tree has: Equivocation 18 (72%), PhantomParent 10 (40%), FarParent 23 (92%),
+      LateGenesisParent 18 (72%), EmptySlot 13 (52%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 13 (52%),
+      NotarFallBackVoteMsg 2 (8%), NotarVoteMsg 25 (100%), SkipFallbackVoteMsg 2 (8%), SkipVoteMsg
+      14 (56%), blockNotarizedAction 13 (52%), certificate FinalizeFast 25 (100%), certificate
+      Notarize 25 (100%), certificate NotarizeFallback 2 (8%), certificate Skip 2 (8%), dispatched
+      BlockNotarized 13 (52%), dispatched ParentReady 2 (8%), dispatched SafeToNotar 2 (8%),
+      dispatched SafeToNotar (intra-window) 1 (4%), dispatched SafeToSkip 2 (8%), fireTimeoutEvent
+      15 (60%), initGenerated 25 (100%), parentReadyAction 2 (8%), pending SafeToNotar dropped 1
+      (4%), pending SafeToNotar resolved 5 (20%), receiveBlock 25 (100%), safeToNotarAction 2 (8%),
+      safeToSkipAction 2 (8%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 8/0/0, BlockNotarized 120/21/6,
+      Finalized(fast) 100/0/0, ParentReady 12/9/1, SafeToNotar 11/3/1, SafeToSkip 11/4/1
+  pending SafeToNotar: resolved 8, dropped past the highest finalized slot 6, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 2
+
+votor MBT target 'intra-window SafeToNotar' (not(intraWindowNotarFallbackVoted)) of agave_pool:
+    25/25 witnesses in at most 300 samples, quint 8.3 s, replay 0.6 s, states per witness
+    min/median/max 22/37/60
+  traces 25, actions {"blockNotarizedAction": 70, "fireTimeoutEvent": 107, "initGenerated": 25,
+      "parentReadyAction": 39, "receiveBlock": 679, "safeToNotarAction": 30, "safeToSkipAction": 9},
+      votes pushed 486
+  traces whose block tree has: Equivocation 23 (92%), PhantomParent 12 (48%), FarParent 21 (84%),
+      LateGenesisParent 17 (68%), EmptySlot 12 (48%)
+  traces with each action, vote, dispatched pool event, or pool certificate: FinalVoteMsg 20 (80%),
+      NotarFallBackVoteMsg 25 (100%), NotarVoteMsg 25 (100%), SkipFallbackVoteMsg 7 (28%),
+      SkipVoteMsg 25 (100%), blockNotarizedAction 21 (84%), certificate Finalize 3 (12%),
+      certificate FinalizeFast 9 (36%), certificate Notarize 23 (92%), certificate NotarizeFallback
+      14 (56%), certificate Skip 14 (56%), dispatched BlockNotarized 21 (84%), dispatched
+      ParentReady 6 (24%), dispatched SafeToNotar 25 (100%), dispatched SafeToNotar (intra-window)
+      25 (100%), dispatched SafeToSkip 7 (28%), fireTimeoutEvent 25 (100%), initGenerated 25 (100%),
+      parentReadyAction 6 (24%), pending SafeToNotar resolved 25 (100%), receiveBlock 25 (100%),
+      safeToNotarAction 25 (100%), safeToSkipAction 7 (28%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 64/0/0, BlockNotarized
+      148/51/19, Finalized(fast) 44/0/0, Finalized(slow) 12/0/0, ParentReady 80/21/18, SafeToNotar
+      90/29/1, SafeToSkip 54/9/0
+  pending SafeToNotar: resolved 66, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 25
+
+votor MBT target 'ParentReady for genesis at slot 4' (not(parentReadyGenesisSlot4)) of agave_pool:
+    25/25 witnesses in at most 300 samples, quint 7.2 s, replay 0.6 s, states per witness
+    min/median/max 5/25/61
+  traces 25, actions {"fireTimeoutEvent": 108, "initGenerated": 25, "parentReadyAction": 65,
+      "receiveBlock": 414, "safeToNotarAction": 18, "safeToSkipAction": 36}, votes pushed 456
+  traces whose block tree has: Equivocation 23 (92%), PhantomParent 16 (64%), FarParent 22 (88%),
+      LateGenesisParent 19 (76%), EmptySlot 21 (84%)
+  traces with each action, vote, dispatched pool event, or pool certificate: NotarFallBackVoteMsg 9
+      (36%), NotarVoteMsg 18 (72%), SkipFallbackVoteMsg 14 (56%), SkipVoteMsg 25 (100%), certificate
+      NotarizeFallback 7 (28%), certificate Skip 25 (100%), dispatched ParentReady 25 (100%),
+      dispatched SafeToNotar 9 (36%), dispatched SafeToNotar (intra-window) 3 (12%), dispatched
+      SafeToSkip 14 (56%), fireTimeoutEvent 25 (100%), initGenerated 25 (100%), parentReadyAction 25
+      (100%), pending SafeToNotar resolved 4 (16%), receiveBlock 23 (92%), safeToNotarAction 9
+      (36%), safeToSkipAction 14 (56%)
+  pool events emitted/dispatched/asked for again: BlockNotarFallback 36/0/0, ParentReady 136/47/18,
+      SafeToNotar 56/14/4, SafeToSkip 56/28/8
+  pending SafeToNotar: resolved 10, dropped past the highest finalized slot 0, stood in for by the
+      driver 0, intra-window SafeToNotar dispatched 3
+```

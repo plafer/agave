@@ -605,6 +605,64 @@ module consensus {
   val slotFinalized = aliveSlots.exists(slot =>
     finalized(slot, allMessages, s.blocks).union(fastFinalized(slot, allMessages, s.blocks)).size() > 0)
 
+  // agave patch 19: witnesses of the scenarios that the targeted model-based tests
+  // (`mbt_votor_agave_gen_targets` and `mbt_votor_agave_pool_targets`) replay, together with
+  // `notarizedInWindow1` and `skipFallbackVoted` above. A target is `not(<witness>)`, passed to
+  // `quint run --invariant`: every trace that violates it reaches the scenario, and is cut off at
+  // the first state where it does. As for the patch 9 witnesses, no action reads them, and
+  // `--witnesses` measures how many traces reach each one (see the target catalogue in
+  // `README.md`, which also lists the scenarios left out).
+
+  /// A benevolent process has `ParentReady` for slot 4 with a parent before slot 3, or with
+  /// genesis, so that at least slot 3 of window 0 is skip-certified.
+  val parentReadySlot4AfterSkip = benevolent.exists(v =>
+    aliveSlots.filter(slot => slot == 4).exists(slot =>
+      s.system.get(v).state[slot].exists(o => match o {
+        | ParentReady(h) => h == -1 or s.blocks.exists(b => b.hash == h and b.slot < 3)
+        | _ => false
+      })))
+
+  /// A benevolent process cast a notar-fallback vote for a block of a slot in which it voted to
+  /// notarize another block, which agave patch 15 allows.
+  val notarFallbackForOtherBlock = s.msgBuffer.exists(m => match m.msg {
+    | NotarFallBackVoteMsg(r) => s.msgBuffer.exists(n => n.sender == m.sender and (match n.msg {
+        | NotarVoteMsg(r2) => r2.slot == r.slot and r2.hash != r.hash
+        | _ => false
+      }))
+    | _ => false
+  })
+
+  /// A slot is finalized, slowly or fast, and a benevolent process voted to skip an earlier slot
+  /// of the slot's leader window. The skip votes come first because they are cheaper to check.
+  val finalizedAfterSkipVote = aliveSlots.exists(slot => and {
+    windowSlots(slot).exists(earlier =>
+      earlier < slot and s.msgBuffer.exists(m => m.msg == SkipVoteMsg(earlier))),
+    finalized(slot, allMessages, s.blocks).union(fastFinalized(slot, allMessages, s.blocks)).size() > 0,
+  })
+
+  /// A block is fast-finalized.
+  val blockFastFinalized =
+    s.blocks.exists(b => isCertified(FastFinalizationCertificate(b.reference()), allMessages))
+
+  /// A benevolent process cast a notar-fallback vote outside the first slot of a leader window,
+  /// where `SafeToNotar` waits for the block's parent to be certified (agave patch 16).
+  val intraWindowNotarFallbackVoted = s.msgBuffer.exists(m => match m.msg {
+    | NotarFallBackVoteMsg(r) => not(firstSlotInLeaderWindow(r.slot))
+    | _ => false
+  })
+
+  /// A benevolent process has `ParentReady` for genesis at slot 4 (agave patch 14).
+  val parentReadyGenesisSlot4 = benevolent.exists(v =>
+    aliveSlots.filter(slot => slot == 4).exists(slot =>
+      s.system.get(v).state[slot].contains(ParentReady(-1))))
+
+  /// A slot is skip-certified without any skip vote, by skip-fallback votes alone, which agave
+  /// patch 18 lets count for `ParentReady`. Too rare for a target (see `README.md`).
+  val skipCertifiedByFallbackOnly = aliveSlots.exists(slot => and {
+    isCertified(SkipCertificate(slot), allMessages),
+    not(allMessages.exists(m => m.msg == SkipVoteMsg(slot))),
+  })
+
   // TODO finalize ancestors locally
 }
 

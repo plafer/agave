@@ -31,13 +31,15 @@
 //! # Targeted traces
 //!
 //! Random simulation reaches some scenarios in only a share of its traces. The `_targets` tests
-//! (`mbt_votor_agave_gen_targets`) replay only traces that reach a given scenario, each cut off at
-//! the step where it happens. A target is a Quint expression over the spec's state that holds
-//! until the scenario happens, such as `not(notarizedInWindow1)`. `quint run --invariant` samples
-//! traces until it has the requested number that violate it, and only those witnesses are
-//! replayed, with the same driver and the same comparison after every step as the simulation
+//! (`mbt_votor_agave_gen_targets` and `mbt_votor_agave_pool_targets`) replay only traces that
+//! reach a given scenario, each cut off at the step where it happens. A target is a Quint
+//! expression over the spec's state that holds until the scenario happens, such as
+//! `not(notarizedInWindow1)`, over a witness of spec patch 9 or 19. `quint run --invariant`
+//! samples traces until it has the requested number that violate it, and only those witnesses
+//! are replayed, with the same driver and the same comparison after every step as the simulation
 //! tests. quint-connect cannot pass `--invariant`, so these tests run `quint` themselves (see
-//! `targets.rs`). They are run, and reproduced with `QUINT_SEED`, like the other tests:
+//! `targets.rs`), one process per target at the same time. They are run, and reproduced with
+//! `QUINT_SEED`, like the other tests:
 //!
 //! ```text
 //! cargo nextest run -p agave-votor --run-ignored ignored-only mbt_votor_agave_gen_targets --no-capture
@@ -45,7 +47,10 @@
 //!
 //! A target without any witness fails the test. Fewer witnesses than asked for are only
 //! reported, since with a random seed that can happen by chance. A failure names the target, the
-//! witness, the step, and the seed.
+//! witness, the step, and the seed. For every target, the test prints what its witnesses drove
+//! agave through: the same counters the simulation tests print, over the target's witnesses
+//! only. `spec/README.md` lists the targets with how many random traces reach each scenario, and
+//! the scenarios left out.
 //!
 //! # What is checked
 //!
@@ -194,6 +199,7 @@
 //!     paper and agave do.
 //! 18. A slot with only skip-fallback votes can be skip-certified for `parentReadyAction`, as
 //!     it already can for `isCertified`.
+//! 19. Witnesses of the scenarios the targets tests replay. No action reads them.
 //!
 //! [quint-connect]: https://github.com/quint-co/quint-connect
 
@@ -367,7 +373,8 @@ struct VotorMbtDriver<I: Instance> {
     _instance: PhantomData<I>,
 }
 
-/// Counters reported when the driver is dropped, to show what the traces exercised.
+/// Counters that show what the traces exercised, reported when the driver is dropped, and by the
+/// targets runner after each target.
 #[derive(Default)]
 struct ReplayStats {
     actions: BTreeMap<String, usize>,
@@ -394,6 +401,9 @@ struct ReplayStats {
     /// Number of `SafeToNotar` events, summed over the pools, that the driver added for dropped
     /// blocks once their parent was certified (see `pool.rs`).
     stood_in: usize,
+    /// Number of `SafeToNotar` events outside the first slot of a window that a spec action
+    /// passed to an event handler.
+    intra_window_dispatched: usize,
 }
 
 impl ReplayStats {
@@ -459,7 +469,7 @@ impl ReplayStats {
             if let PoolEvent::SafeToNotar(block) = event
                 && leader_slot_index(block.slot) != 0
             {
-                increment(&mut self.pool_dispatched, "SafeToNotar (intra-window)");
+                self.intra_window_dispatched = self.intra_window_dispatched.saturating_add(1);
                 self.current_trace
                     .insert("dispatched SafeToNotar (intra-window)".to_string());
             }
@@ -484,6 +494,74 @@ impl ReplayStats {
             };
             self.current_trace.insert(format!("certificate {kind}"));
         }
+    }
+
+    /// The counters, one kind per line, each line indented by two spaces. The pool counters are
+    /// only included `with_pool`.
+    fn summary(&self, with_pool: bool) -> String {
+        let Self {
+            actions,
+            votes,
+            traces,
+            tree_shapes,
+            traces_with,
+            current_trace: _,
+            pool_emitted,
+            pool_dispatched,
+            pool_repeated,
+            pending_resolved,
+            pending_dropped,
+            stood_in,
+            intra_window_dispatched,
+        } = self;
+        let tree_shapes: Vec<String> = TreeShape::ALL
+            .iter()
+            .map(|shape| {
+                let count = tree_shapes.get(shape).copied().unwrap_or_default();
+                format!("{shape:?} {count} ({}%)", percent(count, *traces))
+            })
+            .collect();
+        let traces_with: Vec<String> = traces_with
+            .iter()
+            .map(|(name, &count)| format!("{name} {count} ({}%)", percent(count, *traces)))
+            .collect();
+        let mut summary = format!(
+            "  traces {traces}, actions {actions:?}, votes pushed {votes}\n  traces whose block \
+             tree has: {}\n  traces with each action, vote, dispatched pool event, or pool \
+             certificate: {}",
+            tree_shapes.join(", "),
+            traces_with.join(", "),
+        );
+        if with_pool {
+            let kinds: BTreeSet<&str> = pool_emitted
+                .keys()
+                .chain(pool_dispatched.keys())
+                .chain(pool_repeated.keys())
+                .copied()
+                .collect();
+            let pool_events: Vec<String> = kinds
+                .into_iter()
+                .map(|kind| {
+                    let count = |counts: &BTreeMap<&str, usize>| {
+                        counts.get(kind).copied().unwrap_or_default()
+                    };
+                    format!(
+                        "{kind} {}/{}/{}",
+                        count(pool_emitted),
+                        count(pool_dispatched),
+                        count(pool_repeated)
+                    )
+                })
+                .collect();
+            summary.push_str(&format!(
+                "\n  pool events emitted/dispatched/asked for again: {}\n  pending SafeToNotar: \
+                 resolved {pending_resolved}, dropped past the highest finalized slot \
+                 {pending_dropped}, stood in for by the driver {stood_in}, intra-window \
+                 SafeToNotar dispatched {intra_window_dispatched}",
+                pool_events.join(", "),
+            ));
+        }
+        summary
     }
 }
 
@@ -1007,54 +1085,30 @@ impl<I: Instance> VotorMbtDriver<I> {
     }
 }
 
-impl<I: Instance> Drop for VotorMbtDriver<I> {
-    fn drop(&mut self) {
+impl<I: Instance> VotorMbtDriver<I> {
+    /// Ends the current trace, and returns the counters of every trace replayed since the last
+    /// call, starting new ones. The targets runner keeps one set of counters per target.
+    fn take_stats(&mut self) -> ReplayStats {
         self.stats
             .record_pool_certificates(self.pools.values().flat_map(NodePool::certificate_types));
         self.stats.finish_trace();
-        let ReplayStats {
-            actions,
-            votes,
-            traces,
-            tree_shapes,
-            traces_with,
-            current_trace: _,
-            pool_emitted,
-            pool_dispatched,
-            pool_repeated,
-            pending_resolved,
-            pending_dropped,
-            stood_in,
-        } = &self.stats;
-        let tree_shapes: Vec<String> = TreeShape::ALL
-            .iter()
-            .map(|shape| {
-                let count = tree_shapes.get(shape).copied().unwrap_or_default();
-                format!("{shape:?} {count} ({}%)", percent(count, *traces))
-            })
-            .collect();
-        let traces_with: Vec<String> = traces_with
-            .iter()
-            .map(|(name, &count)| format!("{name} {count} ({}%)", percent(count, *traces)))
-            .collect();
-        let pools = if I::WITH_POOL {
-            format!(
-                ", pool events emitted {pool_emitted:?}, dispatched {pool_dispatched:?}, asked \
-                 for again {pool_repeated:?}, pending SafeToNotar resolved {pending_resolved} and \
-                 dropped past the highest finalized slot {pending_dropped}, SafeToNotar the \
-                 driver stood in for {stood_in}"
-            )
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "votor MBT replay of {}: actions {actions:?}, votes pushed {votes}, traces {traces}, \
-             traces whose block tree has: {}, traces with each action, vote, dispatched pool \
-             event, or pool certificate: {}{pools}",
-            I::STATE_PATH.join("."),
-            tree_shapes.join(", "),
-            traces_with.join(", "),
-        );
+        // The pools' certificates are recorded: the next `init` must not record them again.
+        self.pools.clear();
+        std::mem::take(&mut self.stats)
+    }
+}
+
+impl<I: Instance> Drop for VotorMbtDriver<I> {
+    fn drop(&mut self) {
+        let stats = self.take_stats();
+        // The targets runner has already reported every trace.
+        if stats.traces > 0 {
+            eprintln!(
+                "votor MBT replay of {}:\n{}",
+                I::STATE_PATH.join("."),
+                stats.summary(I::WITH_POOL)
+            );
+        }
     }
 }
 
@@ -1144,14 +1198,101 @@ fn mbt_votor_agave_pool() -> impl Driver {
     VotorMbtDriver::<AgavePool>::new()
 }
 
-/// The scenarios that `mbt_votor_agave_gen_targets` replays witnesses of.
-const AGAVE_GEN_TARGETS: &[Target] = &[Target {
-    name: "notarized in window 1",
-    invariant: "not(notarizedInWindow1)",
-    witnesses: 50,
-    max_samples: 1000,
-    max_steps: 60,
-}];
+/// The scenarios that `mbt_votor_agave_gen_targets` replays witnesses of. Each is a witness of
+/// spec patch 9 or 19, and `spec/README.md` lists how many traces reach it, and the scenarios
+/// left out because too few traces reach them. `witnesses` is sized so that each target takes
+/// about 10 s of Quint time or less.
+const AGAVE_GEN_TARGETS: &[Target] = &[
+    Target {
+        name: "notarized in window 1",
+        invariant: "not(notarizedInWindow1)",
+        witnesses: 50,
+        max_samples: 1000,
+        max_steps: 60,
+    },
+    Target {
+        name: "ParentReady for slot 4 after a skipped slot",
+        invariant: "not(parentReadySlot4AfterSkip)",
+        witnesses: 20,
+        max_samples: 100,
+        max_steps: 60,
+    },
+    Target {
+        name: "notar-fallback vote for a block other than the own notarize vote",
+        invariant: "not(notarFallbackForOtherBlock)",
+        witnesses: 12,
+        max_samples: 500,
+        max_steps: 60,
+    },
+    Target {
+        name: "skip-fallback vote",
+        invariant: "not(skipFallbackVoted)",
+        witnesses: 25,
+        max_samples: 500,
+        max_steps: 60,
+    },
+    Target {
+        name: "slot finalized after a skip vote earlier in its window",
+        invariant: "not(finalizedAfterSkipVote)",
+        witnesses: 10,
+        max_samples: 600,
+        max_steps: 60,
+    },
+];
+
+/// The scenarios that `mbt_votor_agave_pool_targets` replays witnesses of, sized as
+/// [`AGAVE_GEN_TARGETS`].
+const AGAVE_POOL_TARGETS: &[Target] = &[
+    Target {
+        name: "notarized in window 1",
+        invariant: "not(notarizedInWindow1)",
+        witnesses: 20,
+        max_samples: 600,
+        max_steps: 60,
+    },
+    Target {
+        name: "ParentReady for slot 4 after a skipped slot",
+        invariant: "not(parentReadySlot4AfterSkip)",
+        witnesses: 20,
+        max_samples: 100,
+        max_steps: 60,
+    },
+    Target {
+        name: "notar-fallback vote for a block other than the own notarize vote",
+        invariant: "not(notarFallbackForOtherBlock)",
+        witnesses: 20,
+        max_samples: 600,
+        max_steps: 60,
+    },
+    Target {
+        name: "skip-fallback vote",
+        invariant: "not(skipFallbackVoted)",
+        witnesses: 25,
+        max_samples: 300,
+        max_steps: 60,
+    },
+    Target {
+        name: "fast finalization",
+        invariant: "not(blockFastFinalized)",
+        witnesses: 25,
+        max_samples: 300,
+        max_steps: 60,
+    },
+    Target {
+        name: "intra-window SafeToNotar",
+        invariant: "not(intraWindowNotarFallbackVoted)",
+        witnesses: 25,
+        max_samples: 300,
+        max_steps: 60,
+    },
+    Target {
+        name: "ParentReady for genesis at slot 4",
+        invariant: "not(parentReadyGenesisSlot4)",
+        witnesses: 25,
+        max_samples: 300,
+        max_steps: 60,
+    },
+];
 
 /// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
 ///
@@ -1163,6 +1304,20 @@ const AGAVE_GEN_TARGETS: &[Target] = &[Target {
 #[ignore]
 fn mbt_votor_agave_gen_targets() {
     if let Err(err) = run_targets::<AgaveGen>(AGAVE_GEN_TARGETS) {
+        panic!("{err:?}");
+    }
+}
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+///
+/// Replays, for every target in [`AGAVE_POOL_TARGETS`], only `agave_pool` traces that reach the
+/// target's scenario (see "Targeted traces" in the module doc).
+#[test]
+#[ignore]
+fn mbt_votor_agave_pool_targets() {
+    if let Err(err) = run_targets::<AgavePool>(AGAVE_POOL_TARGETS) {
         panic!("{err:?}");
     }
 }
