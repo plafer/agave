@@ -28,6 +28,25 @@
 //! QUINT_VERBOSE=1 cargo nextest run -p agave-votor --run-ignored ignored-only mbt --no-capture
 //! ```
 //!
+//! # Targeted traces
+//!
+//! Random simulation reaches some scenarios in only a share of its traces. The `_targets` tests
+//! (`mbt_votor_agave_gen_targets`) replay only traces that reach a given scenario, each cut off at
+//! the step where it happens. A target is a Quint expression over the spec's state that holds
+//! until the scenario happens, such as `not(notarizedInWindow1)`. `quint run --invariant` samples
+//! traces until it has the requested number that violate it, and only those witnesses are
+//! replayed, with the same driver and the same comparison after every step as the simulation
+//! tests. quint-connect cannot pass `--invariant`, so these tests run `quint` themselves (see
+//! `targets.rs`). They are run, and reproduced with `QUINT_SEED`, like the other tests:
+//!
+//! ```text
+//! cargo nextest run -p agave-votor --run-ignored ignored-only mbt_votor_agave_gen_targets --no-capture
+//! ```
+//!
+//! A target without any witness fails the test. Fewer witnesses than asked for are only
+//! reported, since with a random seed that can happen by chance. A failure names the target, the
+//! witness, the step, and the seed.
+//!
 //! # What is checked
 //!
 //! The event handler is under test in every instance, and the consensus pool in `agave_pool`.
@@ -181,6 +200,7 @@
 mod mapping;
 mod pool;
 mod spec_types;
+mod targets;
 
 use {
     self::{
@@ -189,7 +209,10 @@ use {
             spec_slot, to_spec_block, to_spec_message,
         },
         pool::{AddedVotes, NodePool, PoolEvent},
-        spec_types::{LocalState, Message, NetworkMsg, PoolView, SlotObject, SpecState},
+        spec_types::{
+            LocalState, Message, NetworkMsg, PoolView, SlotObject, SpecAction, SpecState,
+        },
+        targets::{Target, run_targets},
     },
     super::{
         EventHandler,
@@ -225,6 +248,11 @@ type Node = EventHandlerTestContext<NullVoteHistoryStorage>;
 trait Instance {
     /// Path to the environment variable `s` in each ITF state.
     const STATE_PATH: Path;
+    /// The instance module, passed to `quint run --main`.
+    const MAIN: &'static str;
+    /// The initial action, passed to `quint run --init`: `init`, or `initGenerated` for an
+    /// instance whose block tree is drawn per trace.
+    const INIT: &'static str;
     /// `(process id, stake, is benevolent)` for every spec process, with stakes copied from the
     /// instance's `power` table. Byzantine processes get a stake but no node.
     const PROCESSES: &'static [(&'static str, u64, bool)];
@@ -242,6 +270,8 @@ struct SomeByz;
 
 impl Instance for SomeByz {
     const STATE_PATH: Path = &["some_byz::consensus::s"];
+    const MAIN: &'static str = "some_byz";
+    const INIT: &'static str = "init";
     const PROCESSES: &'static [(&'static str, u64, bool)] = &[
         ("v1", 1, true),
         ("v2", 1, true),
@@ -260,6 +290,8 @@ struct SomeByzVp;
 
 impl Instance for SomeByzVp {
     const STATE_PATH: Path = &["some_byz_vp::consensus::s"];
+    const MAIN: &'static str = "some_byz_vp";
+    const INIT: &'static str = "init";
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
     const NUM_SLOTS: usize = 4;
@@ -272,6 +304,8 @@ struct AgaveWindow;
 
 impl Instance for AgaveWindow {
     const STATE_PATH: Path = &["agave_window::consensus::s"];
+    const MAIN: &'static str = "agave_window";
+    const INIT: &'static str = "init";
     const PROCESSES: &'static [(&'static str, u64, bool)] =
         &[("v1", 3, true), ("v2", 2, true), ("b1", 1, false)];
     const NUM_SLOTS: usize = 8;
@@ -284,6 +318,8 @@ struct AgaveGen;
 
 impl Instance for AgaveGen {
     const STATE_PATH: Path = &["agave_gen::consensus::s"];
+    const MAIN: &'static str = "agave_gen";
+    const INIT: &'static str = "initGenerated";
     const PROCESSES: &'static [(&'static str, u64, bool)] = &[
         ("v1", 3, true),
         ("v2", 2, true),
@@ -301,6 +337,8 @@ struct AgavePool;
 
 impl Instance for AgavePool {
     const STATE_PATH: Path = &["agave_pool::consensus::s"];
+    const MAIN: &'static str = "agave_pool";
+    const INIT: &'static str = "initGenerated";
     const PROCESSES: &'static [(&'static str, u64, bool)] = &[
         ("v1", 3, true),
         ("v2", 2, true),
@@ -764,24 +802,7 @@ impl<I: Instance> VotorMbtDriver<I> {
 
 impl<I: Instance> State<VotorMbtDriver<I>> for SpecState {
     fn from_driver(driver: &VotorMbtDriver<I>) -> Result<Self> {
-        let system = driver
-            .nodes
-            .iter()
-            .map(|(v, node)| {
-                let local_state = project_local_state::<I>(v, node, driver.banks.blocks())?;
-                Ok((v.clone(), local_state))
-            })
-            .collect::<Result<_>>()?;
-        let pool = if I::WITH_POOL {
-            Some(project_pools::<I>(&driver.pools)?)
-        } else {
-            None
-        };
-        Ok(SpecState {
-            system,
-            msg_buffer: driver.msg_buffer.clone(),
-            pool,
-        })
+        driver.project()
     }
 }
 
@@ -909,28 +930,79 @@ impl<I: Instance> Driver for VotorMbtDriver<I> {
         }
     }
 
+    /// Reads the step's action and picks into a [`SpecAction`], and applies it.
     fn step(&mut self, step: &Step) -> Result {
-        self.replay(step)?;
-        // After the step, so that an `init` step counts towards the trace it starts.
-        self.stats.record_action(&step.action_taken);
-        Ok(())
+        switch!(step {
+            init(blocks: BTreeSet<SpecBlock>) => self.apply(SpecAction::Init { blocks })?,
+            initGenerated(blocks: BTreeSet<SpecBlock>) => {
+                self.apply(SpecAction::Init { blocks })?
+            },
+            receiveBlock(v: String, block: SpecBlock) => {
+                self.apply(SpecAction::ReceiveBlock { v, block })?
+            },
+            fireTimeoutEvent(v: String, slot: i64) => {
+                self.apply(SpecAction::FireTimeout { v, slot })?
+            },
+            blockNotarizedAction(v: String, b: SpecBlock) => {
+                self.apply(SpecAction::BlockNotarized { v, b })?
+            },
+            parentReadyAction(v: String, slot: i64, b: SpecBlock) => {
+                self.apply(SpecAction::ParentReady { v, slot, b })?
+            },
+            safeToNotarAction(v: String, b: SpecBlock) => {
+                self.apply(SpecAction::SafeToNotar { v, b })?
+            },
+            safeToSkipAction(v: String, slot: i64) => {
+                self.apply(SpecAction::SafeToSkip { v, slot })?
+            },
+        })
     }
 }
 
 impl<I: Instance> VotorMbtDriver<I> {
-    /// Replays one trace step: the spec action becomes one event for the process that took it.
-    fn replay(&mut self, step: &Step) -> Result {
-        switch!(step {
-            init(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
-            initGenerated(blocks: BTreeSet<SpecBlock>) => self.init(blocks)?,
-            receiveBlock(v: String, block: SpecBlock) => self.receive_block(&v, block)?,
-            fireTimeoutEvent(v: String, slot: i64) => self.fire_timeout(&v, slot)?,
-            blockNotarizedAction(v: String, b: SpecBlock) => self.block_notarized(&v, b)?,
-            parentReadyAction(v: String, slot: i64, b: SpecBlock) => {
-                self.parent_ready(&v, slot, b)?
-            },
-            safeToNotarAction(v: String, b: SpecBlock) => self.safe_to_notar(&v, b)?,
-            safeToSkipAction(v: String, slot: i64) => self.safe_to_skip(&v, slot)?,
+    /// Replays one spec action: it becomes one event for the process that took it. This is the
+    /// single dispatch from spec actions to agave events, which both quint-connect's runner and
+    /// the targets runner (`targets.rs`) use.
+    fn apply(&mut self, action: SpecAction) -> Result {
+        // The name of the initial action the trace was generated with, as in `mbt::actionTaken`.
+        let name = match action {
+            SpecAction::Init { .. } => I::INIT,
+            _ => action.name(),
+        };
+        match action {
+            SpecAction::Init { blocks } => self.init(blocks)?,
+            SpecAction::ReceiveBlock { v, block } => self.receive_block(&v, block)?,
+            SpecAction::FireTimeout { v, slot } => self.fire_timeout(&v, slot)?,
+            SpecAction::BlockNotarized { v, b } => self.block_notarized(&v, b)?,
+            SpecAction::ParentReady { v, slot, b } => self.parent_ready(&v, slot, b)?,
+            SpecAction::SafeToNotar { v, b } => self.safe_to_notar(&v, b)?,
+            SpecAction::SafeToSkip { v, slot } => self.safe_to_skip(&v, slot)?,
+        }
+        // After the action, so that an `init` counts towards the trace it starts.
+        self.stats.record_action(name);
+        Ok(())
+    }
+
+    /// Projects agave's state onto the part of the spec's environment that is compared after
+    /// every step (see the module doc).
+    fn project(&self) -> Result<SpecState> {
+        let system = self
+            .nodes
+            .iter()
+            .map(|(v, node)| {
+                let local_state = project_local_state::<I>(v, node, self.banks.blocks())?;
+                Ok((v.clone(), local_state))
+            })
+            .collect::<Result<_>>()?;
+        let pool = if I::WITH_POOL {
+            Some(project_pools::<I>(&self.pools)?)
+        } else {
+            None
+        };
+        Ok(SpecState {
+            system,
+            msg_buffer: self.msg_buffer.clone(),
+            pool,
         })
     }
 }
@@ -1070,4 +1142,27 @@ fn mbt_votor_agave_gen() -> impl Driver {
 )]
 fn mbt_votor_agave_pool() -> impl Driver {
     VotorMbtDriver::<AgavePool>::new()
+}
+
+/// The scenarios that `mbt_votor_agave_gen_targets` replays witnesses of.
+const AGAVE_GEN_TARGETS: &[Target] = &[Target {
+    name: "notarized in window 1",
+    invariant: "not(notarizedInWindow1)",
+    witnesses: 50,
+    max_samples: 1000,
+    max_steps: 60,
+}];
+
+/// Requires the `quint` CLI on `PATH` (`npm install -g @informalsystems/quint`).
+///
+/// Run with: `cargo nextest run -p agave-votor --features agave-unstable-api --run-ignored ignored-only mbt`
+///
+/// Replays, for every target in [`AGAVE_GEN_TARGETS`], only `agave_gen` traces that reach the
+/// target's scenario (see "Targeted traces" in the module doc).
+#[test]
+#[ignore]
+fn mbt_votor_agave_gen_targets() {
+    if let Err(err) = run_targets::<AgaveGen>(AGAVE_GEN_TARGETS) {
+        panic!("{err:?}");
+    }
 }

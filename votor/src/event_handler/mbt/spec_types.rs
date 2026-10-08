@@ -5,12 +5,84 @@
 
 use {
     super::mapping::SpecBlock,
+    anyhow::{Context, Result, bail},
+    itf::value::{Record, Value},
     serde::Deserialize,
     std::{
         collections::{BTreeMap, BTreeSet},
         fmt::{Debug, Write},
     },
 };
+
+/// A spec action together with the nondet picks it uses: one variant per action of the spec's
+/// `step` and `init`, named and with picks named as in the spec.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "tag", content = "value")]
+pub(super) enum SpecAction {
+    /// `init`, or `initGenerated` (agave patch 8), which picks the trace's blocks.
+    #[serde(rename = "init", alias = "initGenerated")]
+    Init { blocks: BTreeSet<SpecBlock> },
+    #[serde(rename = "receiveBlock")]
+    ReceiveBlock { v: String, block: SpecBlock },
+    #[serde(rename = "fireTimeoutEvent")]
+    FireTimeout { v: String, slot: i64 },
+    #[serde(rename = "blockNotarizedAction")]
+    BlockNotarized { v: String, b: SpecBlock },
+    #[serde(rename = "parentReadyAction")]
+    ParentReady { v: String, slot: i64, b: SpecBlock },
+    #[serde(rename = "safeToNotarAction")]
+    SafeToNotar { v: String, b: SpecBlock },
+    #[serde(rename = "safeToSkipAction")]
+    SafeToSkip { v: String, slot: i64 },
+}
+
+impl SpecAction {
+    /// Reads the action from an ITF state's `mbt::actionTaken` and `mbt::nondetPicks`.
+    ///
+    /// `nondet_picks` is a record with one `Option` per nondet pick of the spec: the picks of
+    /// this step are `Some`, and the others `None`. The picks the action does not use
+    /// (`slotCoin`, `timeoutCoin`, `kind`, and so on) are ignored.
+    pub(super) fn from_mbt(action_taken: &str, nondet_picks: Value) -> Result<Self> {
+        let Value::Record(picks) = nondet_picks else {
+            bail!("`mbt::nondetPicks` is not a record: {nondet_picks:?}");
+        };
+        let picks: Record = picks
+            .into_iter()
+            .filter_map(|(name, pick)| some_value(pick).map(|pick| (name, pick)))
+            .collect();
+        let mut action = Record::new();
+        action.insert("tag".to_string(), Value::String(action_taken.to_string()));
+        action.insert("value".to_string(), Value::Record(picks));
+        Self::deserialize(Value::Record(action))
+            .with_context(|| format!("cannot read spec action {action_taken:?} and its picks"))
+    }
+
+    /// The name of the spec action, with `init` for both initial actions.
+    pub(super) fn name(&self) -> &'static str {
+        match self {
+            SpecAction::Init { .. } => "init",
+            SpecAction::ReceiveBlock { .. } => "receiveBlock",
+            SpecAction::FireTimeout { .. } => "fireTimeoutEvent",
+            SpecAction::BlockNotarized { .. } => "blockNotarizedAction",
+            SpecAction::ParentReady { .. } => "parentReadyAction",
+            SpecAction::SafeToNotar { .. } => "safeToNotarAction",
+            SpecAction::SafeToSkip { .. } => "safeToSkipAction",
+        }
+    }
+}
+
+/// The value of an ITF `Option`: `Some` for `{ tag: "Some", value }`, `None` for
+/// `{ tag: "None", .. }`. Any other value is returned as it is, as quint-connect does.
+fn some_value(value: Value) -> Option<Value> {
+    match value {
+        Value::Record(mut record) => match record.get("tag") {
+            Some(Value::String(tag)) if tag == "Some" => record.remove("value"),
+            Some(Value::String(tag)) if tag == "None" => None,
+            _ => Some(Value::Record(record)),
+        },
+        other => Some(other),
+    }
+}
 
 /// Mirror of the spec's `BlockReference`.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
