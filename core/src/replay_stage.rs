@@ -1185,6 +1185,12 @@ impl ReplayStage {
             return None;
         };
 
+        // Finality proved this slot was skipped. Keep its bank until normal root pruning so
+        // generate_new_bank_forks cannot recreate it; cancellation does not make its shreds invalid.
+        if bank.is_replay_cancel_requested() {
+            return None;
+        }
+
         let parent_slot = bank.parent_slot();
         let Some(stats) = progress.get(&parent_slot) else {
             info!("Abandoning replay of unrooted slot {bank_slot}");
@@ -1463,6 +1469,9 @@ impl ReplayStage {
                 info!("Abandoning replay of unrooted slot {bank_slot}");
                 continue;
             };
+            if bank.is_replay_cancel_requested() {
+                continue;
+            }
             if let Some(replay_result) = &replay_result.replay_result {
                 match replay_result {
                     Ok(_) => {}
@@ -1480,6 +1489,7 @@ impl ReplayStage {
                         )?;
                         continue;
                     }
+                    Err(_) if bank.is_replay_cancel_requested() => continue,
                     Err(err) => {
                         mark_replay_dead_slot(
                             bank,
@@ -1517,6 +1527,7 @@ impl ReplayStage {
                     async_verification_freelist,
                 ) {
                     Ok(completed_replay) => completed_replay,
+                    Err(_) if bank.is_replay_cancel_requested() => continue,
                     Err(err) => {
                         mark_replay_dead_slot(
                             bank,
