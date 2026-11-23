@@ -1188,6 +1188,7 @@ impl ReplayStage {
         // Finality proved this slot was skipped. Keep its bank until normal root pruning so
         // generate_new_bank_forks cannot recreate it; cancellation does not make its shreds invalid.
         if bank.is_replay_cancel_requested() {
+            Self::report_cancelled_bank(bank_slot, progress);
             return None;
         }
 
@@ -1412,6 +1413,44 @@ impl ReplayStage {
         verify_result
     }
 
+    /// Reports how far replay of a cancelled bank got, and how long it ran, in
+    /// `replay-slot-cancelled-stats`. Reported at most once per slot, the first time replay
+    /// observes the cancellation.
+    ///
+    /// A slot cancelled before replay started on its bank has no `ForkProgress`: nothing was
+    /// spent on it, so there is nothing to report.
+    fn report_cancelled_bank(slot: Slot, progress: &mut ProgressMap) {
+        let Some(fork_progress) = progress.get_mut(&slot) else {
+            return;
+        };
+        if std::mem::replace(&mut fork_progress.replay_cancel_reported, true) {
+            return;
+        }
+        let replay_total_elapsed_us = fork_progress
+            .replay_stats
+            .read()
+            .unwrap()
+            .started
+            .elapsed()
+            .as_micros() as i64;
+        let (num_txs, num_entries, num_shreds) = {
+            let replay_progress = fork_progress.replay_progress.read().unwrap();
+            (
+                replay_progress.num_txs as i64,
+                replay_progress.num_entries as i64,
+                replay_progress.num_shreds as i64,
+            )
+        };
+        datapoint_info!(
+            "replay-slot-cancelled-stats",
+            ("slot", slot as i64, i64),
+            ("replay_total_elapsed", replay_total_elapsed_us, i64),
+            ("total_transactions", num_txs, i64),
+            ("total_entries", num_entries, i64),
+            ("total_shreds", num_shreds, i64),
+        );
+    }
+
     fn complete_bank_replay(
         bank: &BankWithScheduler,
         bank_progress: &mut ForkProgress,
@@ -1470,6 +1509,7 @@ impl ReplayStage {
                 continue;
             };
             if bank.is_replay_cancel_requested() {
+                Self::report_cancelled_bank(bank_slot, progress);
                 continue;
             }
             if let Some(replay_result) = &replay_result.replay_result {
@@ -1489,7 +1529,10 @@ impl ReplayStage {
                         )?;
                         continue;
                     }
-                    Err(_) if bank.is_replay_cancel_requested() => continue,
+                    Err(_) if bank.is_replay_cancel_requested() => {
+                        Self::report_cancelled_bank(bank_slot, progress);
+                        continue;
+                    }
                     Err(err) => {
                         mark_replay_dead_slot(
                             bank,
@@ -1527,7 +1570,10 @@ impl ReplayStage {
                     async_verification_freelist,
                 ) {
                     Ok(completed_replay) => completed_replay,
-                    Err(_) if bank.is_replay_cancel_requested() => continue,
+                    Err(_) if bank.is_replay_cancel_requested() => {
+                        Self::report_cancelled_bank(bank_slot, progress);
+                        continue;
+                    }
                     Err(err) => {
                         mark_replay_dead_slot(
                             bank,

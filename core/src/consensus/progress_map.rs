@@ -31,6 +31,10 @@ pub struct ForkProgress {
     // These counters cover only blocks replayed since the latest restart.
     pub num_blocks_on_fork: u64,
     pub num_dropped_blocks_on_fork: u64,
+    /// Set once replay has reported the cancellation of this slot in
+    /// `replay-slot-cancelled-stats`. A cancelled bank stays in bank forks until root pruning, so
+    /// replay observes the cancellation on every pass.
+    pub replay_cancel_reported: bool,
 }
 
 impl ForkProgress {
@@ -49,6 +53,7 @@ impl ForkProgress {
             )),
             num_blocks_on_fork,
             num_dropped_blocks_on_fork,
+            replay_cancel_reported: false,
         }
     }
 
